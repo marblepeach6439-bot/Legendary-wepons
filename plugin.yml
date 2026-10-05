@@ -1,0 +1,14 @@
+name: DwarvenWeapons
+version: 1.0.0
+main: dev.dwarven.DwarvenWeapons
+api-version: '1.21'
+description: Six custom netherite weapons with abilities and passives
+commands:
+  dweapons:
+    description: Give or list Dwarven weapons
+    usage: /dweapons <give|list|reload> [player] [weapon]
+    aliases: [weapons, dw]
+    permission: dwarven.admin
+permissions:
+  dwarven.admin:
+    default: op
