@@ -19,6 +19,7 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.block.*;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
+import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.entity.EntityTargetLivingEntityEvent;
 import org.bukkit.event.entity.ProjectileLaunchEvent;
 import org.bukkit.event.player.*;
@@ -26,6 +27,7 @@ import org.bukkit.inventory.*;
 import org.bukkit.inventory.meta.Damageable;
 import org.bukkit.inventory.meta.components.EquippableComponent;
 import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
@@ -40,9 +42,10 @@ import java.util.*;
 public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     static final List<String> IDS = List.of("bloody_eclipse", "stormcaller", "dwarven_pickaxe",
-            "ten_ton_axe", "void_blade", "inferno", "skulk_battle_axe", "royal_spear", "kings_crown", "divine_judgement", "hammer_of_the_void");
+            "ten_ton_axe", "void_blade", "inferno", "skulk_battle_axe", "royal_spear", "kings_crown", "divine_judgement", "hammer_of_the_void",
+            "temporal_reaver", "primal_bow", "mad_scientists_crossbow");
 
-    NamespacedKey KEY;
+    NamespacedKey KEY, HUNT_KEY, PRIMAL_KEY, CROSS_KEY;
     boolean internal = false;   // guard for our own true-damage calls
     boolean mining = false;     // guard for 3x3 mining recursion
 
@@ -57,6 +60,10 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     final Map<UUID, Long> lungeCd = new HashMap<>();
     final Map<UUID, Integer> airHits = new HashMap<>();   // mace hits since last touching the ground
     final Map<UUID, Thrown> thrown = new HashMap<>();
+    final Set<UUID> huntReady = new HashSet<>();
+    final Map<UUID, Integer> momentum = new HashMap<>();
+    final Map<UUID, Mark> marks = new HashMap<>();
+    record Mark(UUID holder, long end, double bonus) {}
     static class Thrown { ItemDisplay disp; Location land; boolean landed; }
 
     record Incin(Location center, int radius, long end) {}
@@ -66,6 +73,9 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     public void onEnable() {
         saveDefaultConfig();
         KEY = new NamespacedKey(this, "weapon");
+        HUNT_KEY = new NamespacedKey(this, "hunt_arrow");
+        PRIMAL_KEY = new NamespacedKey(this, "primal_arrow");
+        CROSS_KEY = new NamespacedKey(this, "cocktail_arrow");
         getServer().getPluginManager().registerEvents(this, this);
         buildSmeltMap();
         new BukkitRunnable() {
@@ -184,6 +194,27 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 lore = List.of("Ability 1 [F]: throw the mace, then Right-click to teleport to it",
                         "Ability 2: Void Strike - the hit after 5 mace hits without touching the ground: 2x damage, Wither II + Poison II 20s",
                         "Passive: Shift+Right-click cycles Wind Burst I / II / III");
+            }
+            case "temporal_reaver" -> {
+                mat = Material.NETHERITE_SWORD; name = "Temporal Reaver"; col = TextColor.color(0x32E164);
+                en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.FIRE_ASPECT, 2); en.put(Enchantment.LOOTING, 3);
+                en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability 1 [F]: Temporal Cleave - freezes time around you (players, mobs, projectiles) for 10s",
+                        "Ability 2 [Shift+F]: Temporal Dismemberment - 3-phase execution of your crosshair target");
+            }
+            case "primal_bow" -> {
+                mat = Material.BOW; name = "Primal Bow"; col = TextColor.color(0x50DCDC);
+                en.put(Enchantment.POWER, 5); en.put(Enchantment.PUNCH, 2); en.put(Enchantment.UNBREAKING, 3);
+                en.put(Enchantment.MENDING, 1); en.put(Enchantment.INFINITY, 1);
+                lore = List.of("Ability 1 [F]: Live for the Hunt - next arrow: Glowing 5 min, Slowness 1 min, Mining Fatigue 1 min",
+                        "Passive: Hunter's Momentum - +1 damage per shot, resets when you are hit");
+            }
+            case "mad_scientists_crossbow" -> {
+                mat = Material.CROSSBOW; name = "Mad Scientist's Crossbow"; col = TextColor.color(0x78FF1E);
+                en.put(Enchantment.QUICK_CHARGE, 5); en.put(Enchantment.MULTISHOT, 1);
+                en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Passive: Furious Cocktail - every arrow carries a random potion effect",
+                        "Passive: Grapple - every hit pulls the enemy 5 blocks toward you");
             }
             default -> { return null; }
         }
@@ -540,6 +571,245 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         }
     }
 
+
+    // ---- Temporal Reaver
+    void unstun(LivingEntity t) {
+        if (t instanceof Player pl) {
+            stunned.remove(pl.getUniqueId());
+            pl.removePotionEffect(PotionEffectType.SLOWNESS); pl.removePotionEffect(PotionEffectType.JUMP_BOOST);
+        } else {
+            if (t instanceof Mob m) m.setAware(true);
+            t.removePotionEffect(PotionEffectType.SLOWNESS);
+        }
+    }
+
+    void ring(Location c, double maxR, Particle particle) {
+        new BukkitRunnable() {
+            int n = 0;
+            @Override public void run() {
+                double r = maxR * (n + 1) / 20.0;
+                for (int i = 0; i < 72; i++) {
+                    double a = i * Math.PI * 2 / 72;
+                    c.getWorld().spawnParticle(particle, c.clone().add(Math.cos(a) * r, 0.3, Math.sin(a) * r), 1, 0, 0, 0, 0);
+                }
+                if (++n >= 20) cancel();
+            }
+        }.runTaskTimer(this, 0, 1);
+    }
+
+    void temporalCleave(Player p) {
+        if (!cd(p, "temporal_cleave", 90)) return;
+        int r = getConfig().getInt("temporal-cleave.radius", 25);
+        int ticks = getConfig().getInt("temporal-cleave.duration-seconds", 10) * 20;
+        Location c = p.getLocation();
+        List<LivingEntity> frozen = new ArrayList<>();
+        Map<Projectile, Vector> proj = new HashMap<>();
+        for (Entity en : p.getNearbyEntities(r, r, r)) {
+            if (en.getLocation().distanceSquared(c) > (double) r * r) continue;
+            if (en instanceof Projectile pr) { proj.put(pr, pr.getVelocity()); pr.setGravity(false); pr.setVelocity(new Vector()); }
+            else if (en instanceof LivingEntity le && !(en instanceof ArmorStand) && (en instanceof Player || en instanceof Mob)) { stun(le, ticks); frozen.add(le); }
+        }
+        p.getWorld().playSound(c, Sound.ENTITY_ENDER_DRAGON_GROWL, 1.2f, 0.5f);
+        ring(c, r, Particle.END_ROD);
+        p.sendActionBar(Component.text("TEMPORAL CLEAVE - time is shattered", NamedTextColor.GREEN));
+        new BukkitRunnable() {
+            int n = 0;
+            @Override public void run() {
+                for (Projectile pr : proj.keySet()) if (pr.isValid()) pr.setVelocity(new Vector());
+                if (++n * 2 >= ticks) {
+                    cancel();
+                    for (LivingEntity le : frozen) if (le.isValid()) unstun(le);
+                    for (Map.Entry<Projectile, Vector> en : proj.entrySet())
+                        if (en.getKey().isValid()) { en.getKey().setGravity(true); en.getKey().setVelocity(en.getValue()); }
+                    Location now = p.isOnline() ? p.getLocation() : c;
+                    now.getWorld().playSound(now, Sound.ENTITY_GENERIC_EXPLODE, 1.5f, 0.6f);
+                    ring(now, r, Particle.DRAGON_BREATH);
+                    ring(now, r, Particle.END_ROD);
+                }
+            }
+        }.runTaskTimer(this, 2, 2);
+    }
+
+    void temporalDismember(Player p) {
+        int range = getConfig().getInt("temporal-dismemberment.range", 25);
+        LivingEntity t = lookTarget(p, range);
+        if (t == null) { p.sendActionBar(Component.text("No target in sight", NamedTextColor.GRAY)); return; }
+        if (!cd(p, "temporal_dismemberment", 120)) return;
+        double cloneDmg = getConfig().getDouble("temporal-dismemberment.clone-damage-hearts", 1.5) * 2;
+        double eraseDmg = getConfig().getDouble("temporal-dismemberment.erasure-damage-hearts", 3.0) * 2;
+        int markSec = getConfig().getInt("temporal-dismemberment.mark-seconds", 10);
+        double bonus = getConfig().getDouble("temporal-dismemberment.mark-bonus", 0.25);
+
+        // Phase 1 + 2: frozen for 10 seconds (blocks movement, teleports, pearls, wind charges)
+        stun(t, 200);
+        p.sendActionBar(Component.text("TEMPORAL DISMEMBERMENT - lock on", NamedTextColor.DARK_GREEN));
+        new BukkitRunnable() {   // rotating sigil, phase 1 (5s)
+            int n = 0;
+            @Override public void run() {
+                if (!t.isValid() || t.isDead() || n >= 50) { cancel(); return; }
+                Location base = t.getLocation().add(0, 0.1 + n * 0.02, 0);
+                double a = n * 0.3;
+                for (int k = 0; k < 8; k++) {
+                    double ang = a + k * Math.PI / 4;
+                    for (double rr : new double[]{1.2 + n * 0.03, 2.2 + n * 0.03}) {
+                        Location l = base.clone().add(Math.cos(ang) * rr, 0, Math.sin(ang) * rr);
+                        l.getWorld().spawnParticle(Particle.DRAGON_BREATH, l, 1, 0, 0, 0, 0);
+                        l.getWorld().spawnParticle(Particle.PORTAL, l, 2, 0.05, 0.05, 0.05, 0.1);
+                    }
+                }
+                if (n % 10 == 0) t.getWorld().playSound(t.getLocation(), Sound.BLOCK_NOTE_BLOCK_CHIME, 1f, 0.5f + n / 60f);
+                n++;
+            }
+        }.runTaskTimer(this, 0, 2);
+
+        // Phase 2: five fracture clones, 5 hits total
+        for (int i = 0; i < 5; i++) {
+            final int idx = i;
+            Bukkit.getScheduler().runTaskLater(this, () -> fractureClone(p, t, idx, cloneDmg), 100L + i * 20L);
+        }
+        // Phase 3: unfreeze, then the final strike after 2 seconds
+        Bukkit.getScheduler().runTaskLater(this, () -> { if (t.isValid()) unstun(t); }, 200L);
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (!t.isValid() || t.isDead()) return;
+            Location l = t.getLocation();
+            l.getWorld().strikeLightningEffect(l);
+            l.getWorld().spawnParticle(Particle.END_ROD, l.clone().add(0, 1, 0), 80, .5, 1, .5, 0.2);
+            l.getWorld().playSound(l, Sound.ENTITY_WARDEN_SONIC_BOOM, 1.5f, 0.6f);
+            trueDamage(t, p, eraseDmg);
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                Location at = t.getLocation();
+                if (t.isDead() || !t.isValid()) {
+                    Bukkit.broadcast(Component.text(t.getName() + " was erased from the timeline by " + p.getName(), NamedTextColor.GREEN));
+                    World w = at.getWorld();
+                    w.spawnParticle(Particle.EXPLOSION_EMITTER, at, 4, 1, 1, 1);
+                    w.spawnParticle(Particle.DRAGON_BREATH, at.clone().add(0, 1, 0), 300, 2, 2, 2, 0.1);
+                    w.spawnParticle(Particle.END_ROD, at.clone().add(0, 1, 0), 200, 2, 2, 2, 0.3);
+                    w.playSound(at, Sound.ENTITY_ENDER_DRAGON_DEATH, 1f, 1.2f);
+                } else {
+                    marks.put(t.getUniqueId(), new Mark(p.getUniqueId(), System.currentTimeMillis() + markSec * 1000L, bonus));
+                    int mt = markSec * 20;
+                    for (PotionEffectType pt : new PotionEffectType[]{PotionEffectType.GLOWING, PotionEffectType.WEAKNESS,
+                            PotionEffectType.SLOWNESS, PotionEffectType.DARKNESS, PotionEffectType.MINING_FATIGUE,
+                            PotionEffectType.WITHER, PotionEffectType.HUNGER})
+                        t.addPotionEffect(new PotionEffect(pt, mt, 0));
+                    p.sendActionBar(Component.text("Target MARKED (+" + (int) (bonus * 100) + "% damage)", NamedTextColor.GREEN));
+                }
+            }, 2L);
+        }, 240L);
+    }
+
+    void fractureClone(Player p, LivingEntity t, int idx, double dmg) {
+        if (!t.isValid() || t.isDead() || !p.isOnline()) return;
+        double ang = idx * (Math.PI * 2 / 5) + Math.random();
+        Location loc = t.getLocation().add(Math.cos(ang) * 2.5, 0, Math.sin(ang) * 2.5);
+        loc.setDirection(t.getLocation().toVector().subtract(loc.toVector()));
+        ArmorStand as = t.getWorld().spawn(loc, ArmorStand.class, a -> {
+            a.setArms(true); a.setBasePlate(false); a.setInvulnerable(true); a.setGravity(false); a.setSilent(true);
+            a.getEquipment().setArmorContents(p.getInventory().getArmorContents());
+            a.getEquipment().setItemInMainHand(p.getInventory().getItemInMainHand());
+        });
+        loc.getWorld().spawnParticle(Particle.PORTAL, loc.clone().add(0, 1, 0), 40, .3, .8, .3, .3);
+        Bukkit.getScheduler().runTaskLater(this, () -> {      // slash 1 deals the damage
+            if (!t.isValid() || t.isDead()) return;
+            t.getWorld().spawnParticle(Particle.SWEEP_ATTACK, t.getLocation().add(0, 1, 0), 3, .4, .4, .4, 0);
+            t.getWorld().playSound(t.getLocation(), Sound.ENTITY_PLAYER_ATTACK_SWEEP, 1f, 0.8f);
+            trueDamage(t, p, dmg);
+        }, 3L);
+        Bukkit.getScheduler().runTaskLater(this, () -> {      // slash 2 is the afterimage
+            if (!t.isValid()) return;
+            t.getWorld().spawnParticle(Particle.SWEEP_ATTACK, t.getLocation().add(0, 1.2, 0), 3, .4, .4, .4, 0);
+            t.getWorld().spawnParticle(Particle.END_ROD, loc.clone().add(0, 1, 0), 20, .3, .8, .3, 0.05);
+        }, 9L);
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            loc.getWorld().spawnParticle(Particle.PORTAL, loc.clone().add(0, 1, 0), 30, .3, .8, .3, .3);
+            as.remove();
+        }, 16L);
+    }
+
+    @EventHandler
+    public void onFrozenTeleport(PlayerTeleportEvent e) {
+        if (isStunned(e.getPlayer()) && (e.getCause() == PlayerTeleportEvent.TeleportCause.ENDER_PEARL
+                || e.getCause() == PlayerTeleportEvent.TeleportCause.CHORUS_FRUIT)) e.setCancelled(true);
+    }
+
+    // ---- Primal Bow
+    void liveForTheHunt(Player p) {
+        if (huntReady.contains(p.getUniqueId())) { p.sendActionBar(Component.text("Your next arrow is already marked", NamedTextColor.GRAY)); return; }
+        if (!cd(p, "live_for_the_hunt", 600)) return;
+        huntReady.add(p.getUniqueId());
+        p.getWorld().playSound(p.getLocation(), Sound.ENTITY_WOLF_HOWL, 1f, 0.8f);
+        p.sendActionBar(Component.text("LIVE FOR THE HUNT - next arrow is marked", NamedTextColor.AQUA));
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onShoot(EntityShootBowEvent e) {
+        if (!(e.getEntity() instanceof Player p) || !"primal_bow".equals(id(e.getBow()))) return;
+        if (e.getProjectile() instanceof AbstractArrow a) {
+            a.getPersistentDataContainer().set(PRIMAL_KEY, PersistentDataType.BYTE, (byte) 1);
+            if (huntReady.remove(p.getUniqueId())) a.getPersistentDataContainer().set(HUNT_KEY, PersistentDataType.BYTE, (byte) 1);
+        }
+        int max = getConfig().getInt("hunters-momentum-max", 30);
+        int m = Math.min(max, momentum.getOrDefault(p.getUniqueId(), 0) + 1);
+        momentum.put(p.getUniqueId(), m);
+        p.sendActionBar(Component.text("Hunter's Momentum +" + m, NamedTextColor.AQUA));
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onHunterHurt(EntityDamageByEntityEvent e) {
+        if (internal || !(e.getEntity() instanceof Player v)) return;
+        if (momentum.remove(v.getUniqueId()) != null) v.sendActionBar(Component.text("Hunter's Momentum lost", NamedTextColor.RED));
+    }
+
+    // ---- Mad Scientist's Crossbow
+    @EventHandler(ignoreCancelled = true)
+    public void onCrossbowLaunch(ProjectileLaunchEvent e) {
+        if (!(e.getEntity() instanceof Arrow a) || !(a.getShooter() instanceof Player p)) return;
+        if (!"mad_scientists_crossbow".equals(id(p.getInventory().getItemInMainHand()))
+                && !"mad_scientists_crossbow".equals(id(p.getInventory().getItemInOffHand()))) return;
+        PotionEffectType[] pool = {PotionEffectType.POISON, PotionEffectType.SLOWNESS, PotionEffectType.WEAKNESS, PotionEffectType.WITHER,
+                PotionEffectType.BLINDNESS, PotionEffectType.INSTANT_DAMAGE, PotionEffectType.HUNGER, PotionEffectType.NAUSEA,
+                PotionEffectType.LEVITATION, PotionEffectType.GLOWING, PotionEffectType.SPEED, PotionEffectType.STRENGTH,
+                PotionEffectType.REGENERATION, PotionEffectType.INSTANT_HEALTH, PotionEffectType.RESISTANCE, PotionEffectType.JUMP_BOOST};
+        PotionEffectType t = pool[new Random().nextInt(pool.length)];
+        a.addCustomEffect(new PotionEffect(t, 200, 1), true);
+        a.setColor(t.getColor());
+        a.getPersistentDataContainer().set(CROSS_KEY, PersistentDataType.BYTE, (byte) 1);
+    }
+
+    void grapplePull(LivingEntity v, Player p, double blocks) {
+        if (!v.isValid() || !p.isOnline() || !p.getWorld().equals(v.getWorld())) return;
+        Vector dir = p.getLocation().toVector().subtract(v.getLocation().toVector());
+        double dist = dir.length();
+        if (dist < 2.5) return;
+        dir.normalize();
+        Location dest = null;
+        for (double d = Math.min(blocks, dist - 1.5); d >= 0.5; d -= 0.5) {
+            Location c = v.getLocation().add(dir.clone().multiply(d));
+            if (!c.getBlock().getType().isSolid() && !c.clone().add(0, 1, 0).getBlock().getType().isSolid()) { dest = c; break; }
+        }
+        if (dest == null) return;
+        beamParticles(p.getEyeLocation().add(0, -0.2, 0), v.getLocation().add(0, 1, 0), Particle.CRIT);
+        v.teleport(dest);
+    }
+
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onArrowHit(EntityDamageByEntityEvent e) {
+        if (internal || !(e.getDamager() instanceof AbstractArrow a) || !(a.getShooter() instanceof Player p)
+                || !(e.getEntity() instanceof LivingEntity v)) return;
+        PersistentDataContainer pdc = a.getPersistentDataContainer();
+        if (pdc.has(HUNT_KEY, PersistentDataType.BYTE)) {
+            v.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING, 6000, 0));
+            v.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 1200, 1));
+            v.addPotionEffect(new PotionEffect(PotionEffectType.MINING_FATIGUE, 1200, 1));
+        }
+        if (pdc.has(PRIMAL_KEY, PersistentDataType.BYTE)) {
+            int m = momentum.getOrDefault(p.getUniqueId(), 0);
+            if (m > 0) e.setDamage(e.getDamage() + m);          // +1 damage per stack
+        }
+        if (pdc.has(CROSS_KEY, PersistentDataType.BYTE))
+            Bukkit.getScheduler().runTask(this, () -> grapplePull(v, p, 5.0));
+    }
+
     // ---- Royal Spear
     void royalJudgement(Player p) {
         LivingEntity t = lookTarget(p, 40);
@@ -633,7 +903,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     public void onSwap(PlayerSwapHandItemsEvent e) {
         Player p = e.getPlayer();
         String id = id(p.getInventory().getItemInMainHand());
-        if (id == null || id.equals("kings_crown")) return;
+        if (id == null || id.equals("kings_crown") || id.equals("mad_scientists_crossbow")) return;
         e.setCancelled(true);
         if (isStunned(p)) return;
         boolean sh = p.isSneaking();
@@ -646,6 +916,8 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "inferno" -> { if (sh) incinerate(p); else acidicBlaze(p); }
             case "skulk_battle_axe" -> { if (sh) summonWarden(p); else sculkBeams(p); }
             case "royal_spear" -> { if (sh) piercingStrike(p); else royalJudgement(p); }
+            case "temporal_reaver" -> { if (sh) temporalDismember(p); else temporalCleave(p); }
+            case "primal_bow" -> { if (!sh) liveForTheHunt(p); }
             case "divine_judgement" -> { if (!sh) smite(p); }
             case "hammer_of_the_void" -> { if (!sh) voidThrow(p); }
             default -> {}
@@ -1016,6 +1288,10 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 && p.getWorld().equals(victim.getWorld())
                 && victim.getLocation().distanceSquared(in.center()) <= (double) in.radius() * in.radius())
             e.setDamage(e.getDamage() * 2);
+
+        Mark mk = marks.get(victim.getUniqueId());
+        if (mk != null && mk.holder().equals(p.getUniqueId()) && mk.end() > System.currentTimeMillis())
+            e.setDamage(e.getDamage() * (1 + mk.bonus()));
 
         if (id == null) return;
         final Player pf = p;

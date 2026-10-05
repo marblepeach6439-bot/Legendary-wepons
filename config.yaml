@@ -16,6 +16,9 @@ cooldowns:
   sculk_beams: 60
   summon_warden: 300
   royal_judgement: 60
+  temporal_cleave: 90
+  temporal_dismemberment: 120
+  live_for_the_hunt: 600
   smite: 30
   final_verdict: 30
   void_throw: 20
@@ -27,3 +30,15 @@ dome-radius: 20
 # Skulk Battle Axe
 sculk-beam-armor-durability: 50   # durability removed from a random armor piece per beam
 warden-lifetime-seconds: 60       # summoned warden despawns after this long
+# Temporal Reaver
+temporal-cleave:
+  radius: 25
+  duration-seconds: 10
+temporal-dismemberment:
+  range: 25
+  clone-damage-hearts: 1.5
+  erasure-damage-hearts: 3.0
+  mark-seconds: 10
+  mark-bonus: 0.25      # +25% damage from the holder against a Marked target
+# Primal Bow
+hunters-momentum-max: 30
