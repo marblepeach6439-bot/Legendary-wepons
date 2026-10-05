@@ -19,6 +19,7 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.block.*;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
+import org.bukkit.event.entity.EntityTargetLivingEntityEvent;
 import org.bukkit.event.entity.ProjectileLaunchEvent;
 import org.bukkit.event.player.*;
 import org.bukkit.inventory.*;
@@ -29,6 +30,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.util.BoundingBox;
 import org.bukkit.util.RayTraceResult;
 import org.bukkit.util.Vector;
 
@@ -37,7 +39,7 @@ import java.util.*;
 public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     static final List<String> IDS = List.of("bloody_eclipse", "stormcaller", "dwarven_pickaxe",
-            "ten_ton_axe", "void_blade", "inferno");
+            "ten_ton_axe", "void_blade", "inferno", "skulk_battle_axe", "royal_spear", "kings_crown");
 
     NamespacedKey KEY;
     boolean internal = false;   // guard for our own true-damage calls
@@ -51,6 +53,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     final Map<Block, Material> dome = new HashMap<>();  // dome block -> original material (always air)
     final Map<UUID, Incin> incin = new HashMap<>();
     final Map<Material, Material> smelt = new HashMap<>();
+    final Map<UUID, Long> lungeCd = new HashMap<>();
 
     record Incin(Location center, int radius, long end) {}
 
@@ -139,6 +142,29 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 lore = List.of("Ability 1 [F]: Acidic Blaze - unquenchable fire that ignores fire resistance, 10s",
                         "Ability 2 [Shift+F]: Incineration - evaporates water, enemies take 2x damage, 20s");
             }
+            case "skulk_battle_axe" -> {
+                mat = Material.NETHERITE_AXE; name = "Skulk Battle Axe"; col = TextColor.color(0x28C8DC);
+                en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability 1 [F]: Sculk Beams - 3 warden beams, 2 hearts true damage + heavy armor durability each",
+                        "Ability 2 [Shift+F]: Summon a Warden",
+                        "Passive: Wardens are not hostile to you, Strength I, Speed II, Resistance I");
+            }
+            case "royal_spear" -> {
+                Material sp = Material.matchMaterial("NETHERITE_SPEAR");
+                mat = sp != null ? sp : Material.NETHERITE_SWORD; name = "Royal Spear"; col = TextColor.color(0xFFC83C);
+                Enchantment lunge = lungeEnchant();
+                if (lunge != null) en.put(lunge, 3);
+                en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability 1 [F]: Royal Judgement - throw the spear: 3 hearts true damage, Wither II + Poison II 20s",
+                        "Ability 2 [Shift+F]: Piercing Strike - 30 block beam through blocks, 4 hearts true damage",
+                        "Passive: Speed II.  Nerf: you can only lunge once every 5 seconds");
+            }
+            case "kings_crown" -> {
+                mat = Material.NETHERITE_HELMET; name = "King's Crown"; col = TextColor.color(0xFFD700);
+                en.put(Enchantment.PROTECTION, 5);
+                lore = List.of("Unbreakable",
+                        "Worn: Speed III, Strength I, +10 extra hearts");
+            }
             default -> { return null; }
         }
         ItemStack item = new ItemStack(mat);
@@ -148,6 +174,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         for (String s : lore) l.add(Component.text(s, NamedTextColor.GRAY).decoration(TextDecoration.ITALIC, false));
         meta.lore(l);
         for (Map.Entry<Enchantment, Integer> e : en.entrySet()) meta.addEnchant(e.getKey(), e.getValue(), true);
+        if (id.equals("kings_crown")) meta.setUnbreakable(true);
         meta.getPersistentDataContainer().set(KEY, PersistentDataType.STRING, id);
         meta.setItemModel(new NamespacedKey("dwarven", id));   // resource pack: assets/dwarven/items/<id>.json
         item.setItemMeta(meta);
@@ -235,8 +262,162 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         return (t instanceof LivingEntity le && !(t instanceof ArmorStand)) ? le : null;
     }
 
+
+    Enchantment lungeEnchant() { return Registry.ENCHANTMENT.get(NamespacedKey.minecraft("lunge")); }
+
+    boolean hasWeapon(Player p, String id) {
+        for (ItemStack i : p.getInventory().getContents()) if (id.equals(id(i))) return true;
+        return false;
+    }
+
+    void setLunge(Player p, boolean on) {
+        Enchantment l = lungeEnchant();
+        if (l == null) return;
+        PlayerInventory inv = p.getInventory();
+        for (int i = 0; i < inv.getSize(); i++) {
+            ItemStack it = inv.getItem(i);
+            if (!"royal_spear".equals(id(it))) continue;
+            if (on) it.addUnsafeEnchantment(l, 3); else it.removeEnchantment(l);
+            inv.setItem(i, it);
+        }
+    }
+
+    void drainArmor(LivingEntity t, int amount) {
+        EntityEquipment eq = t.getEquipment();
+        if (eq == null) return;
+        ItemStack[] arm = eq.getArmorContents();
+        List<Integer> idx = new ArrayList<>();
+        for (int i = 0; i < arm.length; i++) if (arm[i] != null && arm[i].getType().getMaxDurability() > 0) idx.add(i);
+        if (idx.isEmpty()) return;
+        int i = idx.get(new Random().nextInt(idx.size()));
+        ItemStack it = arm[i];
+        if (it.getItemMeta() instanceof Damageable dm) {
+            int nd = dm.getDamage() + amount;
+            if (nd >= it.getType().getMaxDurability()) { arm[i] = null; t.getWorld().playSound(t.getLocation(), Sound.ENTITY_ITEM_BREAK, 1f, 1f); }
+            else { dm.setDamage(nd); it.setItemMeta(dm); }
+            eq.setArmorContents(arm);
+        }
+    }
+
+    void beamParticles(Location a, Location b, Particle particle) {
+        Vector d = b.toVector().subtract(a.toVector());
+        double len = d.length(); if (len < 0.01) return;
+        d.normalize();
+        for (double x = 0; x < len; x += 0.6) a.getWorld().spawnParticle(particle, a.clone().add(d.clone().multiply(x)), 1, 0, 0, 0, 0);
+    }
+
+    // ---- Skulk Battle Axe
+    void sculkBeams(Player p) {
+        LivingEntity t = lookTarget(p, 30);
+        if (t == null) { p.sendActionBar(Component.text("No target in sight", NamedTextColor.GRAY)); return; }
+        if (!cd(p, "sculk_beams", 60)) return;
+        int drain = getConfig().getInt("sculk-beam-armor-durability", 50);
+        for (int i = 0; i < 3; i++) {
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                if (!t.isValid() || t.isDead() || !p.isOnline()) return;
+                Location from = p.getEyeLocation().add(0, -0.2, 0), to = t.getLocation().add(0, t.getHeight() / 2, 0);
+                beamParticles(from, to, Particle.SONIC_BOOM);
+                p.getWorld().playSound(p.getLocation(), Sound.ENTITY_WARDEN_SONIC_BOOM, 1f, 1f);
+                trueDamage(t, p, 4.0);
+                drainArmor(t, drain);
+            }, i * 6L);
+        }
+    }
+
+    void summonWarden(Player p) {
+        if (!cd(p, "summon_warden", 300)) return;
+        Vector dir = p.getLocation().getDirection().setY(0);
+        if (dir.lengthSquared() < 1e-4) dir = new Vector(0, 0, 1);
+        Location l = p.getLocation().add(dir.normalize().multiply(3));
+        Warden w = p.getWorld().spawn(l, Warden.class);
+        LivingEntity t = lookTarget(p, 30);
+        if (t != null) w.setAnger(t, 150);
+        p.getWorld().playSound(l, Sound.ENTITY_WARDEN_EMERGE, 1f, 1f);
+        Bukkit.getScheduler().runTaskLater(this, () -> { if (w.isValid()) w.remove(); },
+                getConfig().getInt("warden-lifetime-seconds", 60) * 20L);
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onWardenTarget(EntityTargetLivingEntityEvent e) {
+        if (e.getEntity() instanceof Warden && e.getTarget() instanceof Player p && hasWeapon(p, "skulk_battle_axe")) e.setCancelled(true);
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onWardenHurt(EntityDamageByEntityEvent e) {
+        if (e.getDamager() instanceof Warden && e.getEntity() instanceof Player p && hasWeapon(p, "skulk_battle_axe")) e.setCancelled(true);
+    }
+
+    // ---- Royal Spear
+    void royalJudgement(Player p) {
+        LivingEntity t = lookTarget(p, 40);
+        if (t == null) { p.sendActionBar(Component.text("No target in sight", NamedTextColor.GRAY)); return; }
+        if (!cd(p, "royal_judgement", 60)) return;
+        ItemStack spear = p.getInventory().getItemInMainHand().clone();
+        Location start = p.getEyeLocation().add(p.getEyeLocation().getDirection());
+        ItemDisplay d = p.getWorld().spawn(start, ItemDisplay.class, x -> x.setItemStack(spear));
+        p.getWorld().playSound(p.getLocation(), Sound.ITEM_TRIDENT_THROW, 1f, 0.8f);
+        new BukkitRunnable() {
+            int n = 0;
+            @Override public void run() {
+                if (!t.isValid() || t.isDead() || !d.isValid() || n++ > 60) { d.remove(); cancel(); return; }
+                Location target = t.getLocation().add(0, t.getHeight() / 2, 0);
+                Vector v = target.toVector().subtract(d.getLocation().toVector());
+                if (v.length() < 1.6) {
+                    d.remove(); cancel();
+                    trueDamage(t, p, 6.0);
+                    t.addPotionEffect(new PotionEffect(PotionEffectType.WITHER, 400, 1));
+                    t.addPotionEffect(new PotionEffect(PotionEffectType.POISON, 400, 1));
+                    t.getWorld().playSound(t.getLocation(), Sound.ITEM_TRIDENT_HIT, 1f, 0.8f);
+                    t.getWorld().spawnParticle(Particle.CRIT, target, 30, .4, .5, .4);
+                    return;
+                }
+                Location nl = d.getLocation().add(v.clone().normalize().multiply(1.8));
+                nl.setDirection(v);
+                d.teleport(nl);
+                d.getWorld().spawnParticle(Particle.END_ROD, nl, 2, 0.05, 0.05, 0.05, 0);
+            }
+        }.runTaskTimer(this, 0, 1);
+    }
+
+    void piercingStrike(Player p) {
+        if (!cd(p, "piercing_strike", 20)) return;
+        Location eye = p.getEyeLocation(); Vector dir = eye.getDirection().normalize();
+        Location end = eye.clone().add(dir.clone().multiply(30));
+        beamParticles(eye.clone().add(0, -0.2, 0), end, Particle.END_ROD);
+        p.getWorld().playSound(p.getLocation(), Sound.ENTITY_WARDEN_SONIC_BOOM, 0.8f, 1.6f);
+        Location mid = eye.clone().add(dir.clone().multiply(15));
+        for (Entity en : p.getWorld().getNearbyEntities(mid, 16, 16, 16)) {
+            if (en == p || !(en instanceof LivingEntity le) || en instanceof ArmorStand) continue;
+            BoundingBox box = en.getBoundingBox().expand(0.3);
+            RayTraceResult r = box.rayTrace(eye.toVector(), dir, 30);
+            if (r != null) trueDamage(le, p, 8.0);           // goes through blocks: no block check
+        }
+    }
+
+    @EventHandler
+    public void onSwing(PlayerAnimationEvent e) {
+        if (e.getAnimationType() != PlayerAnimationType.ARM_SWING) return;
+        Player p = e.getPlayer();
+        if (!"royal_spear".equals(id(p.getInventory().getItemInMainHand())) || lungeEnchant() == null) return;
+        long now = System.currentTimeMillis();
+        Long until = lungeCd.get(p.getUniqueId());
+        if (until != null && until > now) return;
+        lungeCd.put(p.getUniqueId(), now + 5000);
+        Bukkit.getScheduler().runTask(this, () -> setLunge(p, false));   // strip Lunge right after this one is used
+        Bukkit.getScheduler().runTaskLater(this, () -> setLunge(p, true), 100L);
+    }
+
+    @EventHandler
+    public void onJoinLunge(PlayerJoinEvent e) { setLunge(e.getPlayer(), true); }
+
     // ------------------------------------------------------------------ passives
     void passives(Player p) {
+        ItemStack helm = p.getInventory().getHelmet();
+        if ("kings_crown".equals(id(helm))) {
+            p.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 30, 2, true, false, true));
+            p.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, 30, 0, true, false, true));
+            p.addPotionEffect(new PotionEffect(PotionEffectType.HEALTH_BOOST, 30, 4, true, false, true));   // +20 HP = 10 hearts
+        }
         String id = id(p.getInventory().getItemInMainHand());
         if (id == null) return;
         switch (id) {
@@ -245,6 +426,11 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 effect(p, PotionEffectType.CONDUIT_POWER, 0); }
             case "void_blade" -> { effect(p, PotionEffectType.SPEED, 2); effect(p, PotionEffectType.STRENGTH, 0);
                 effect(p, PotionEffectType.FIRE_RESISTANCE, 0); }
+            case "skulk_battle_axe" -> { effect(p, PotionEffectType.STRENGTH, 0); effect(p, PotionEffectType.SPEED, 1);
+                effect(p, PotionEffectType.RESISTANCE, 0); }
+            case "royal_spear" -> { effect(p, PotionEffectType.SPEED, 1);
+                Long u = lungeCd.get(p.getUniqueId());
+                if (u == null || u < System.currentTimeMillis()) setLunge(p, true); }
             default -> {}
         }
     }
@@ -254,7 +440,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     public void onSwap(PlayerSwapHandItemsEvent e) {
         Player p = e.getPlayer();
         String id = id(p.getInventory().getItemInMainHand());
-        if (id == null) return;
+        if (id == null || id.equals("kings_crown")) return;
         e.setCancelled(true);
         if (isStunned(p)) return;
         boolean sh = p.isSneaking();
@@ -265,6 +451,8 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "ten_ton_axe" -> { if (sh) durabilityDrain(p); else stunningStrike(p); }
             case "void_blade" -> { if (sh) pullOfTheVoid(p); else voidWalk(p); }
             case "inferno" -> { if (sh) incinerate(p); else acidicBlaze(p); }
+            case "skulk_battle_axe" -> { if (sh) summonWarden(p); else sculkBeams(p); }
+            case "royal_spear" -> { if (sh) piercingStrike(p); else royalJudgement(p); }
             default -> {}
         }
     }

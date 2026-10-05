@@ -1,0 +1,26 @@
+# Optional: URL of the hosted resource pack zip (sent to players on join). Leave empty to disable.
+resource-pack-url: ""
+# Cooldowns in seconds
+cooldowns:
+  bloodbath: 45
+  blinding_eclipse: 60
+  lightning_storm: 30
+  tides_call: 40
+  call_of_the_deep: 120
+  stunning_strike: 30
+  durability_drain: 60
+  void_walk: 15
+  pull_of_the_void: 30
+  acidic_blaze: 45
+  incineration: 120
+  sculk_beams: 60
+  summon_warden: 300
+  royal_judgement: 60
+  piercing_strike: 20   # not specified by you, change freely
+# Incineration: radius of the affected area (the "40 block area" = 40 wide, so radius 20)
+incineration-radius: 20
+# Dome radius for Call of the Deep
+dome-radius: 20
+# Skulk Battle Axe
+sculk-beam-armor-durability: 50   # durability removed from a random armor piece per beam
+warden-lifetime-seconds: 60       # summoned warden despawns after this long
