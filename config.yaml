@@ -16,6 +16,9 @@ cooldowns:
   sculk_beams: 60
   summon_warden: 300
   royal_judgement: 60
+  smite: 30
+  final_verdict: 30
+  void_throw: 20
   piercing_strike: 20   # not specified by you, change freely
 # Incineration: radius of the affected area (the "40 block area" = 40 wide, so radius 20)
 incineration-radius: 20

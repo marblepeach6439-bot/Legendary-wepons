@@ -24,6 +24,7 @@ import org.bukkit.event.entity.ProjectileLaunchEvent;
 import org.bukkit.event.player.*;
 import org.bukkit.inventory.*;
 import org.bukkit.inventory.meta.Damageable;
+import org.bukkit.inventory.meta.components.EquippableComponent;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -39,7 +40,7 @@ import java.util.*;
 public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     static final List<String> IDS = List.of("bloody_eclipse", "stormcaller", "dwarven_pickaxe",
-            "ten_ton_axe", "void_blade", "inferno", "skulk_battle_axe", "royal_spear", "kings_crown");
+            "ten_ton_axe", "void_blade", "inferno", "skulk_battle_axe", "royal_spear", "kings_crown", "divine_judgement", "hammer_of_the_void");
 
     NamespacedKey KEY;
     boolean internal = false;   // guard for our own true-damage calls
@@ -54,6 +55,9 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     final Map<UUID, Incin> incin = new HashMap<>();
     final Map<Material, Material> smelt = new HashMap<>();
     final Map<UUID, Long> lungeCd = new HashMap<>();
+    final Map<UUID, Integer> airHits = new HashMap<>();   // mace hits since last touching the ground
+    final Map<UUID, Thrown> thrown = new HashMap<>();
+    static class Thrown { ItemDisplay disp; Location land; boolean landed; }
 
     record Incin(Location center, int radius, long end) {}
 
@@ -165,6 +169,22 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 lore = List.of("Unbreakable",
                         "Worn: Speed III, Strength I, +10 extra hearts");
             }
+            case "divine_judgement" -> {
+                mat = Material.MACE; name = "Divine Judgement"; col = TextColor.color(0xF5CD5A);
+                en.put(Enchantment.DENSITY, 2); en.put(Enchantment.WIND_BURST, 1);
+                en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability 1 [F]: Smite - throw the mace, pull the enemy to you, 3 hearts true damage",
+                        "Ability 2: Final Verdict - 5th mace hit without touching the ground explodes: 2x damage, 60 durability to every armor piece",
+                        "Passive: Shift+Right-click cycles Wind Burst I / II / III");
+            }
+            case "hammer_of_the_void" -> {
+                mat = Material.MACE; name = "Hammer of the Void"; col = TextColor.color(0xAA50FF);
+                en.put(Enchantment.DENSITY, 2); en.put(Enchantment.WIND_BURST, 1);
+                en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability 1 [F]: throw the mace, then Right-click to teleport to it",
+                        "Ability 2: Void Strike - the hit after 5 mace hits without touching the ground: 2x damage, Wither II + Poison II 20s",
+                        "Passive: Shift+Right-click cycles Wind Burst I / II / III");
+            }
             default -> { return null; }
         }
         ItemStack item = new ItemStack(mat);
@@ -174,7 +194,13 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         for (String s : lore) l.add(Component.text(s, NamedTextColor.GRAY).decoration(TextDecoration.ITALIC, false));
         meta.lore(l);
         for (Map.Entry<Enchantment, Integer> e : en.entrySet()) meta.addEnchant(e.getKey(), e.getValue(), true);
-        if (id.equals("kings_crown")) meta.setUnbreakable(true);
+        if (id.equals("kings_crown")) {
+            meta.setUnbreakable(true);
+            EquippableComponent eq = meta.getEquippable();      // worn model: assets/dwarven/equipment/kings_crown.json
+            eq.setSlot(EquipmentSlot.HEAD);
+            eq.setModel(new NamespacedKey("dwarven", "kings_crown"));
+            meta.setEquippable(eq);
+        }
         meta.getPersistentDataContainer().set(KEY, PersistentDataType.STRING, id);
         meta.setItemModel(new NamespacedKey("dwarven", id));   // resource pack: assets/dwarven/items/<id>.json
         item.setItemMeta(meta);
@@ -225,12 +251,14 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     }
 
     // ------------------------------------------------------------------ helpers
-    boolean cd(Player p, String key, int def) {
+    boolean cd(Player p, String key, int def) { return cd(p, key, def, false); }
+
+    boolean cd(Player p, String key, int def, boolean quiet) {
         long now = System.currentTimeMillis();
         String k = p.getUniqueId() + key;
         Long until = cooldowns.get(k);
         if (until != null && until > now) {
-            p.sendActionBar(Component.text(key.replace('_', ' ') + " on cooldown: " + ((until - now + 999) / 1000) + "s", NamedTextColor.RED));
+            if (!quiet) p.sendActionBar(Component.text(key.replace('_', ' ') + " on cooldown: " + ((until - now + 999) / 1000) + "s", NamedTextColor.RED));
             return false;
         }
         cooldowns.put(k, now + getConfig().getInt("cooldowns." + key, def) * 1000L);
@@ -347,6 +375,171 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         if (e.getDamager() instanceof Warden && e.getEntity() instanceof Player p && hasWeapon(p, "skulk_battle_axe")) e.setCancelled(true);
     }
 
+
+    // ---- Maces (Divine Judgement / Hammer of the Void)
+    void drainAllArmor(LivingEntity t, int amount) {
+        EntityEquipment eq = t.getEquipment();
+        if (eq == null) return;
+        ItemStack[] arm = eq.getArmorContents();
+        for (int i = 0; i < arm.length; i++) {
+            ItemStack it = arm[i];
+            if (it == null || it.getType().getMaxDurability() <= 0 || !(it.getItemMeta() instanceof Damageable dm)) continue;
+            int nd = dm.getDamage() + amount;
+            if (nd >= it.getType().getMaxDurability()) { arm[i] = null; t.getWorld().playSound(t.getLocation(), Sound.ENTITY_ITEM_BREAK, 1f, 1f); }
+            else { dm.setDamage(nd); it.setItemMeta(dm); }
+        }
+        eq.setArmorContents(arm);
+    }
+
+    void flyItem(Player p, LivingEntity t, ItemStack item, Runnable onHit) {
+        Location start = p.getEyeLocation().add(p.getEyeLocation().getDirection());
+        ItemDisplay d = p.getWorld().spawn(start, ItemDisplay.class, x -> x.setItemStack(item));
+        new BukkitRunnable() {
+            int n = 0;
+            @Override public void run() {
+                if (!t.isValid() || t.isDead() || !d.isValid() || n++ > 60) { d.remove(); cancel(); return; }
+                Location target = t.getLocation().add(0, t.getHeight() / 2, 0);
+                Vector v = target.toVector().subtract(d.getLocation().toVector());
+                if (v.length() < 1.6) { d.remove(); cancel(); onHit.run(); return; }
+                Location nl = d.getLocation().add(v.clone().normalize().multiply(1.8));
+                nl.setDirection(v);
+                d.teleport(nl);
+                d.getWorld().spawnParticle(Particle.END_ROD, nl, 2, 0.05, 0.05, 0.05, 0);
+            }
+        }.runTaskTimer(this, 0, 1);
+    }
+
+    void smite(Player p) {
+        LivingEntity t = lookTarget(p, 40);
+        if (t == null) { p.sendActionBar(Component.text("No target in sight", NamedTextColor.GRAY)); return; }
+        if (!cd(p, "smite", 30)) return;
+        ItemStack it = p.getInventory().getItemInMainHand().clone();
+        p.getWorld().playSound(p.getLocation(), Sound.ITEM_TRIDENT_THROW, 1f, 0.6f);
+        flyItem(p, t, it, () -> {
+            if (!t.isValid() || t.isDead()) return;
+            trueDamage(t, p, 6.0);
+            t.getWorld().strikeLightningEffect(t.getLocation());
+            new BukkitRunnable() {
+                int n = 0;
+                @Override public void run() {
+                    if (!t.isValid() || t.isDead() || !p.isOnline() || n++ > 15) { cancel(); return; }
+                    Vector v = p.getLocation().toVector().subtract(t.getLocation().toVector());
+                    if (v.length() < 2.5) { cancel(); return; }
+                    t.setVelocity(v.normalize().multiply(1.1).setY(0.25));   // pull toward the wielder
+                }
+            }.runTaskTimer(this, 0, 1);
+        });
+    }
+
+    void maceHit(EntityDamageByEntityEvent e, Player p, LivingEntity v, String id) {
+        UUID u = p.getUniqueId();
+        if (p.isOnGround()) { airHits.remove(u); return; }
+        int c = airHits.getOrDefault(u, 0) + 1;
+        if (id.equals("divine_judgement")) {
+            if (c >= 5) {
+                if (!cd(p, "final_verdict", 30, true)) { airHits.put(u, 5); return; }   // wait for cooldown, keep the charge
+                Location l = v.getLocation();
+                e.setDamage(e.getDamage() * 2);
+                l.getWorld().spawnParticle(Particle.EXPLOSION_EMITTER, l, 1);
+                l.getWorld().playSound(l, Sound.ENTITY_GENERIC_EXPLODE, 1.2f, 1f);
+                for (Entity en : v.getNearbyEntities(3, 3, 3))
+                    if (en instanceof LivingEntity le && en != p && !(en instanceof ArmorStand)) drainAllArmor(le, 60);
+                drainAllArmor(v, 60);
+                p.sendActionBar(Component.text("FINAL VERDICT", NamedTextColor.GOLD));
+                airHits.remove(u);
+                return;
+            }
+        } else if (c >= 6) {   // 5 hits, then the NEXT hit is the void strike
+            e.setDamage(e.getDamage() * 2);
+            v.addPotionEffect(new PotionEffect(PotionEffectType.WITHER, 400, 1));
+            v.addPotionEffect(new PotionEffect(PotionEffectType.POISON, 400, 1));
+            v.getWorld().spawnParticle(Particle.REVERSE_PORTAL, v.getLocation().add(0, 1, 0), 60, .4, .8, .4);
+            p.sendActionBar(Component.text("VOID STRIKE", NamedTextColor.DARK_PURPLE));
+            airHits.remove(u);
+            return;
+        }
+        airHits.put(u, c);
+    }
+
+    @EventHandler
+    public void onGroundReset(PlayerMoveEvent e) {
+        if (e.getPlayer().isOnGround()) airHits.remove(e.getPlayer().getUniqueId());
+    }
+
+    void voidThrow(Player p) {
+        if (!cd(p, "void_throw", 20)) return;
+        Thrown old = thrown.remove(p.getUniqueId());
+        if (old != null && old.disp != null && old.disp.isValid()) old.disp.remove();
+        ItemStack it = p.getInventory().getItemInMainHand().clone();
+        Location eye = p.getEyeLocation(); Vector dir = eye.getDirection().normalize();
+        ItemDisplay d = p.getWorld().spawn(eye.clone().add(dir), ItemDisplay.class, x -> x.setItemStack(it));
+        Thrown th = new Thrown(); th.disp = d; thrown.put(p.getUniqueId(), th);
+        p.getWorld().playSound(p.getLocation(), Sound.ENTITY_ENDER_PEARL_THROW, 1f, 0.6f);
+        new BukkitRunnable() {
+            final Location pos = eye.clone().add(dir);
+            int n = 0;
+            @Override public void run() {
+                if (!d.isValid()) { cancel(); return; }
+                if (n++ > 24) { th.land = pos.clone(); th.landed = true; p.sendActionBar(Component.text("Right-click to teleport to the mace", NamedTextColor.LIGHT_PURPLE)); cancel(); return; }
+                RayTraceResult r = pos.getWorld().rayTrace(pos, dir, 1.7, FluidCollisionMode.NEVER, true, 0.4,
+                        en -> en != p && en instanceof LivingEntity && !(en instanceof ArmorStand));
+                if (r != null) {
+                    double dist = Math.max(0, pos.toVector().distance(r.getHitPosition()) - 0.8);
+                    th.land = pos.clone().add(dir.clone().multiply(dist)); th.landed = true;
+                    d.teleport(th.land);
+                    p.sendActionBar(Component.text("Right-click to teleport to the mace", NamedTextColor.LIGHT_PURPLE));
+                    cancel(); return;
+                }
+                pos.add(dir.clone().multiply(1.7));
+                d.teleport(pos);
+                d.getWorld().spawnParticle(Particle.PORTAL, pos, 6, .1, .1, .1, .2);
+            }
+        }.runTaskTimer(this, 0, 1);
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (thrown.get(p.getUniqueId()) == th) { thrown.remove(p.getUniqueId()); if (d.isValid()) d.remove(); }
+        }, 300L);
+    }
+
+    @EventHandler
+    public void onMaceClick(PlayerInteractEvent e) {
+        if (e.getHand() != EquipmentSlot.HAND) return;
+        if (e.getAction() != Action.RIGHT_CLICK_AIR && e.getAction() != Action.RIGHT_CLICK_BLOCK) return;
+        Player p = e.getPlayer();
+        ItemStack it = p.getInventory().getItemInMainHand();
+        String id = id(it);
+        if (!"divine_judgement".equals(id) && !"hammer_of_the_void".equals(id)) return;
+        if (isStunned(p)) return;
+        if (p.isSneaking()) {                       // cycle Wind Burst I -> II -> III
+            e.setCancelled(true);
+            int cur = it.getEnchantmentLevel(Enchantment.WIND_BURST);
+            int next = cur >= 3 ? 1 : cur + 1;
+            it.addUnsafeEnchantment(Enchantment.WIND_BURST, next);
+            p.getInventory().setItemInMainHand(it);
+            p.sendActionBar(Component.text("Wind Burst " + next, NamedTextColor.AQUA));
+            p.playSound(p.getLocation(), Sound.BLOCK_NOTE_BLOCK_CHIME, 1f, 0.8f + next * 0.2f);
+            return;
+        }
+        if (id.equals("hammer_of_the_void")) {
+            Thrown th = thrown.get(p.getUniqueId());
+            if (th == null) return;
+            e.setCancelled(true);
+            if (!th.landed) { p.sendActionBar(Component.text("The mace is still flying", NamedTextColor.GRAY)); return; }
+            Location dest = null;
+            for (double dy = -1.6; dy <= 0.01; dy += 0.2) {
+                Location c = th.land.clone().add(0, dy, 0);
+                if (!c.getBlock().getType().isSolid() && !c.clone().add(0, 1, 0).getBlock().getType().isSolid()) { dest = c; break; }
+            }
+            thrown.remove(p.getUniqueId());
+            if (th.disp != null && th.disp.isValid()) th.disp.remove();
+            if (dest == null) { p.sendActionBar(Component.text("No safe spot at the mace", NamedTextColor.RED)); return; }
+            dest.setYaw(p.getLocation().getYaw()); dest.setPitch(p.getLocation().getPitch());
+            p.getWorld().spawnParticle(Particle.PORTAL, p.getLocation().add(0, 1, 0), 60, .4, .8, .4);
+            p.teleport(dest);
+            p.getWorld().spawnParticle(Particle.REVERSE_PORTAL, dest.clone().add(0, 1, 0), 60, .4, .8, .4);
+            p.getWorld().playSound(dest, Sound.ENTITY_ENDERMAN_TELEPORT, 1f, 0.8f);
+        }
+    }
+
     // ---- Royal Spear
     void royalJudgement(Player p) {
         LivingEntity t = lookTarget(p, 40);
@@ -453,6 +646,8 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "inferno" -> { if (sh) incinerate(p); else acidicBlaze(p); }
             case "skulk_battle_axe" -> { if (sh) summonWarden(p); else sculkBeams(p); }
             case "royal_spear" -> { if (sh) piercingStrike(p); else royalJudgement(p); }
+            case "divine_judgement" -> { if (!sh) smite(p); }
+            case "hammer_of_the_void" -> { if (!sh) voidThrow(p); }
             default -> {}
         }
     }
@@ -834,6 +1029,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 }
                 if (n % 25 == 0) bleed(victim, p);
             }
+            case "divine_judgement", "hammer_of_the_void" -> maceHit(e, p, victim, id);
             case "stormcaller" -> {
                 if (n % 5 == 0) Bukkit.getScheduler().runTask(this, () -> {
                     if (!victim.isValid() || victim.isDead()) return;
