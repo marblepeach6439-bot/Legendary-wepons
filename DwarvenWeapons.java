@@ -823,7 +823,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         if (huntReady.contains(p.getUniqueId())) { msg(p, Component.text("Your next arrow is already marked", NamedTextColor.GRAY)); return; }
         if (!cd(p, "live_for_the_hunt", 600)) return;
         huntReady.add(p.getUniqueId());
-        p.getWorld().playSound(p.getLocation(), Sound.ENTITY_WOLF_HOWL, 1f, 0.8f);
+        p.getWorld().playSound(p.getLocation(), Sound.ENTITY_WOLF_GROWL, 1.2f, 0.6f);
         expandRing(p.getLocation(), 6, 10, l -> { dustAt(l, 80, 225, 225, 1.7f, 1, 0.05); sp(p.getWorld(), Particle.HAPPY_VILLAGER, l, 1); });
         auraTask(p, 80, l -> { dustAt(l, 80, 225, 225, 1.3f, 1, 0.05); sp(p.getWorld(), Particle.END_ROD, l, 1, 0, 0, 0, 0.01); });
         msg(p, Component.text("LIVE FOR THE HUNT - next arrow is marked", NamedTextColor.AQUA));
