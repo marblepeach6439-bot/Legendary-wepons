@@ -25,6 +25,7 @@ import org.bukkit.event.entity.ProjectileLaunchEvent;
 import org.bukkit.event.player.*;
 import org.bukkit.inventory.*;
 import org.bukkit.inventory.meta.Damageable;
+import org.bukkit.inventory.meta.components.CustomModelDataComponent;
 import org.bukkit.inventory.meta.components.EquippableComponent;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataContainer;
@@ -38,11 +39,12 @@ import org.bukkit.util.RayTraceResult;
 import org.bukkit.util.Vector;
 
 import java.util.*;
+import java.util.function.Consumer;
 
 public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     static final List<String> IDS = List.of("bloody_eclipse", "stormcaller", "dwarven_pickaxe",
-            "ten_ton_axe", "void_blade", "inferno", "skulk_battle_axe", "royal_spear", "kings_crown", "divine_judgement", "hammer_of_the_void",
+            "ten_ton_axe", "void_blade", "inferno", "sculk_battle_axe", "royal_spear", "kings_crown", "divine_judgement", "hammer_of_the_void",
             "temporal_reaver", "primal_bow", "mad_scientists_crossbow");
 
     NamespacedKey KEY, HUNT_KEY, PRIMAL_KEY, CROSS_KEY;
@@ -54,12 +56,14 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     final Map<UUID, Long> eclipsed = new HashMap<>();   // victims of Blinding Eclipse (no wind charges/cobwebs)
     final Map<UUID, Long> stunned = new HashMap<>();
     final Map<String, Integer> hitCounters = new HashMap<>();
+    final Map<Block, Material> domeFloor = new HashMap<>();   // breakable floor under the dome (block -> type we placed)
     final Map<Block, Material> dome = new HashMap<>();  // dome block -> original material (always air)
     final Map<UUID, Incin> incin = new HashMap<>();
     final Map<Material, Material> smelt = new HashMap<>();
     final Map<UUID, Long> lungeCd = new HashMap<>();
     final Map<UUID, Integer> airHits = new HashMap<>();   // mace hits since last touching the ground
     final Map<UUID, Thrown> thrown = new HashMap<>();
+    final Map<UUID, Long> holdUntil = new HashMap<>();   // action-bar message hold (HUD pauses)
     final Set<UUID> huntReady = new HashSet<>();
     final Map<UUID, Integer> momentum = new HashMap<>();
     final Map<UUID, Mark> marks = new HashMap<>();
@@ -81,6 +85,30 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         new BukkitRunnable() {
             @Override public void run() { for (Player p : Bukkit.getOnlinePlayers()) passives(p); }
         }.runTaskTimer(this, 20, 20);
+        new BukkitRunnable() {          // cooldown HUD + weapon auras + warden peace
+            int t = 0;
+            @Override public void run() {
+                t++;
+                Set<UUID> axeCarriers = new HashSet<>();
+                for (Player p : Bukkit.getOnlinePlayers()) {
+                    String id = id(p.getInventory().getItemInMainHand());
+                    if (id != null) { if (t % 2 == 0) auraFx(p, id); hud(p, id); }
+                    if ("kings_crown".equals(id(p.getInventory().getHelmet())) && t % 2 == 0) {
+                        Location h = p.getEyeLocation().add(0, 0.55, 0);
+                        sp(p.getWorld(), Particle.END_ROD, h, 1, 0.25, 0.05, 0.25, 0.01);
+                        dustAt(h, 255, 210, 70, 0.8f, 1, 0.3);
+                    }
+                    if (hasWeapon(p, "sculk_battle_axe")) axeCarriers.add(p.getUniqueId());
+                }
+                if (!axeCarriers.isEmpty()) {
+                    for (World w : Bukkit.getWorlds()) for (Warden wd : w.getEntitiesByClass(Warden.class)) {
+                        if (wd.getTarget() instanceof Player tp && axeCarriers.contains(tp.getUniqueId())) wd.setTarget(null);
+                        for (Player pl : w.getPlayers())
+                            if (axeCarriers.contains(pl.getUniqueId()) && pl.getLocation().distanceSquared(wd.getLocation()) < 6400) wd.clearAnger(pl);
+                    }
+                }
+            }
+        }.runTaskTimer(this, 10, 5);
     }
 
     @Override
@@ -90,6 +118,9 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             if (t == Material.DIRT || t == Material.STONE) en.getKey().setType(en.getValue(), false);
         }
         dome.clear();
+        for (Map.Entry<Block, Material> en : domeFloor.entrySet())
+            if (en.getKey().getType() == en.getValue()) en.getKey().setType(Material.AIR, false);
+        domeFloor.clear();
     }
 
     void buildSmeltMap() {
@@ -105,7 +136,8 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     // ------------------------------------------------------------------ items
     String id(ItemStack i) {
         if (i == null || !i.hasItemMeta()) return null;
-        return i.getItemMeta().getPersistentDataContainer().get(KEY, PersistentDataType.STRING);
+        String v = i.getItemMeta().getPersistentDataContainer().get(KEY, PersistentDataType.STRING);
+        return "skulk_battle_axe".equals(v) ? "sculk_battle_axe" : v;     // items made before the spelling fix
     }
 
     ItemStack make(String id) {
@@ -122,7 +154,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             }
             case "stormcaller" -> {
                 mat = Material.TRIDENT; name = "Stormcaller"; col = TextColor.color(0x5AC8FF);
-                en.put(Enchantment.RIPTIDE, 3); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                en.put(Enchantment.RIPTIDE, 3); en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
                 lore = List.of("Ability 1 [F]: Lightning Storm - 3 strikes, 2 hearts true damage each",
                         "Ability 2 [Shift+F]: Tides Call - pull & drown everything within 20 blocks",
                         "Passive: lightning every 5 hits, Water Breathing, Dolphin's Grace, Conduit Power");
@@ -156,8 +188,8 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 lore = List.of("Ability 1 [F]: Acidic Blaze - unquenchable fire that ignores fire resistance, 10s",
                         "Ability 2 [Shift+F]: Incineration - evaporates water, enemies take 2x damage, 20s");
             }
-            case "skulk_battle_axe" -> {
-                mat = Material.NETHERITE_AXE; name = "Skulk Battle Axe"; col = TextColor.color(0x28C8DC);
+            case "sculk_battle_axe" -> {
+                mat = Material.NETHERITE_AXE; name = "Sculk Battle Axe"; col = TextColor.color(0x28C8DC);
                 en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
                 lore = List.of("Ability 1 [F]: Sculk Beams - 3 warden beams, 2 hearts true damage + heavy armor durability each",
                         "Ability 2 [Shift+F]: Summon a Warden",
@@ -225,15 +257,17 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         for (String s : lore) l.add(Component.text(s, NamedTextColor.GRAY).decoration(TextDecoration.ITALIC, false));
         meta.lore(l);
         for (Map.Entry<Enchantment, Integer> e : en.entrySet()) meta.addEnchant(e.getKey(), e.getValue(), true);
+        meta.setUnbreakable(true);
         if (id.equals("kings_crown")) {
-            meta.setUnbreakable(true);
             EquippableComponent eq = meta.getEquippable();      // worn model: assets/dwarven/equipment/kings_crown.json
             eq.setSlot(EquipmentSlot.HEAD);
             eq.setModel(new NamespacedKey("dwarven", "kings_crown"));
             meta.setEquippable(eq);
         }
         meta.getPersistentDataContainer().set(KEY, PersistentDataType.STRING, id);
-        meta.setItemModel(new NamespacedKey("dwarven", id));   // resource pack: assets/dwarven/items/<id>.json
+        CustomModelDataComponent cmd = meta.getCustomModelDataComponent();   // pack swaps the model; no pack = vanilla look
+        cmd.setStrings(List.of(id));
+        meta.setCustomModelDataComponent(cmd);
         item.setItemMeta(meta);
         return item;
     }
@@ -289,7 +323,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         String k = p.getUniqueId() + key;
         Long until = cooldowns.get(k);
         if (until != null && until > now) {
-            if (!quiet) p.sendActionBar(Component.text(key.replace('_', ' ') + " on cooldown: " + ((until - now + 999) / 1000) + "s", NamedTextColor.RED));
+            if (!quiet) msg(p, Component.text(key.replace('_', ' ') + " on cooldown: " + ((until - now + 999) / 1000) + "s", NamedTextColor.RED));
             return false;
         }
         cooldowns.put(k, now + getConfig().getInt("cooldowns." + key, def) * 1000L);
@@ -362,21 +396,25 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         Vector d = b.toVector().subtract(a.toVector());
         double len = d.length(); if (len < 0.01) return;
         d.normalize();
-        for (double x = 0; x < len; x += 0.6) a.getWorld().spawnParticle(particle, a.clone().add(d.clone().multiply(x)), 1, 0, 0, 0, 0);
+        for (double x = 0; x < len; x += 0.6) sp(a.getWorld(), particle, a.clone().add(d.clone().multiply(x)), 1, 0, 0, 0, 0);
     }
 
-    // ---- Skulk Battle Axe
+    // ---- Sculk Battle Axe
     void sculkBeams(Player p) {
         LivingEntity t = lookTarget(p, 30);
-        if (t == null) { p.sendActionBar(Component.text("No target in sight", NamedTextColor.GRAY)); return; }
+        if (t == null) { msg(p, Component.text("No target in sight", NamedTextColor.GRAY)); return; }
         if (!cd(p, "sculk_beams", 60)) return;
         int drain = getConfig().getInt("sculk-beam-armor-durability", 50);
+        World w = p.getWorld();
         for (int i = 0; i < 3; i++) {
             Bukkit.getScheduler().runTaskLater(this, () -> {
                 if (!t.isValid() || t.isDead() || !p.isOnline()) return;
                 Location from = p.getEyeLocation().add(0, -0.2, 0), to = t.getLocation().add(0, t.getHeight() / 2, 0);
                 beamParticles(from, to, Particle.SONIC_BOOM);
-                p.getWorld().playSound(p.getLocation(), Sound.ENTITY_WARDEN_SONIC_BOOM, 1f, 1f);
+                helix(from, to, 0.6, 0.3, l -> { sp(w, Particle.SCULK_SOUL, l, 1, 0, 0, 0, 0.01); dustAt(l, 30, 200, 230, 1.5f, 1, 0.05); });
+                w.playSound(p.getLocation(), Sound.ENTITY_WARDEN_SONIC_BOOM, 1f, 1f);
+                sp(w, Particle.SCULK_SOUL, to, 25, .4, .6, .4, 0.08);
+                expandRing(t.getLocation(), 3, 6, l -> dustAt(l, 30, 200, 230, 1.5f, 1, 0.05));
                 trueDamage(t, p, 4.0);
                 drainArmor(t, drain);
             }, i * 6L);
@@ -388,22 +426,26 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         Vector dir = p.getLocation().getDirection().setY(0);
         if (dir.lengthSquared() < 1e-4) dir = new Vector(0, 0, 1);
         Location l = p.getLocation().add(dir.normalize().multiply(3));
-        Warden w = p.getWorld().spawn(l, Warden.class);
+        World world = l.getWorld();
+        Warden w = world.spawn(l, Warden.class);
         LivingEntity t = lookTarget(p, 30);
         if (t != null) w.setAnger(t, 150);
-        p.getWorld().playSound(l, Sound.ENTITY_WARDEN_EMERGE, 1f, 1f);
+        world.playSound(l, Sound.ENTITY_WARDEN_EMERGE, 1f, 1f);
+        world.playSound(l, Sound.ENTITY_WARDEN_ROAR, 1f, 0.8f);
+        expandRing(l, 8, 12, x -> { sp(world, Particle.SCULK_SOUL, x, 2, .1, .5, .1, 0.03); dustAt(x, 20, 160, 190, 1.5f, 1, 0.05); });
+        column(l, 5, x -> sp(world, Particle.SCULK_SOUL, x, 3, .5, .1, .5, 0.02));
         Bukkit.getScheduler().runTaskLater(this, () -> { if (w.isValid()) w.remove(); },
                 getConfig().getInt("warden-lifetime-seconds", 60) * 20L);
     }
 
     @EventHandler(ignoreCancelled = true)
     public void onWardenTarget(EntityTargetLivingEntityEvent e) {
-        if (e.getEntity() instanceof Warden && e.getTarget() instanceof Player p && hasWeapon(p, "skulk_battle_axe")) e.setCancelled(true);
+        if (e.getEntity() instanceof Warden && e.getTarget() instanceof Player p && hasWeapon(p, "sculk_battle_axe")) e.setCancelled(true);
     }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onWardenHurt(EntityDamageByEntityEvent e) {
-        if (e.getDamager() instanceof Warden && e.getEntity() instanceof Player p && hasWeapon(p, "skulk_battle_axe")) e.setCancelled(true);
+        if (e.getDamager() instanceof Warden && e.getEntity() instanceof Player p && hasWeapon(p, "sculk_battle_axe")) e.setCancelled(true);
     }
 
 
@@ -435,21 +477,28 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 Location nl = d.getLocation().add(v.clone().normalize().multiply(1.8));
                 nl.setDirection(v);
                 d.teleport(nl);
-                d.getWorld().spawnParticle(Particle.END_ROD, nl, 2, 0.05, 0.05, 0.05, 0);
+                sp(d.getWorld(), Particle.END_ROD, nl, 3, 0.1, 0.1, 0.1, 0.02);
+                dustAt(nl, 255, 215, 90, 1.5f, 3, 0.15);
             }
         }.runTaskTimer(this, 0, 1);
     }
 
     void smite(Player p) {
         LivingEntity t = lookTarget(p, 40);
-        if (t == null) { p.sendActionBar(Component.text("No target in sight", NamedTextColor.GRAY)); return; }
+        if (t == null) { msg(p, Component.text("No target in sight", NamedTextColor.GRAY)); return; }
         if (!cd(p, "smite", 30)) return;
         ItemStack it = p.getInventory().getItemInMainHand().clone();
         p.getWorld().playSound(p.getLocation(), Sound.ITEM_TRIDENT_THROW, 1f, 0.6f);
         flyItem(p, t, it, () -> {
             if (!t.isValid() || t.isDead()) return;
+            World w = t.getWorld(); Location g = t.getLocation();
             trueDamage(t, p, 6.0);
-            t.getWorld().strikeLightningEffect(t.getLocation());
+            w.strikeLightningEffect(g);
+            sp(w, Particle.END_ROD, g.clone().add(0, 1, 0), 60, .5, .9, .5, 0.4);
+            sp(w, Particle.TOTEM_OF_UNDYING, g.clone().add(0, 1, 0), 40, .5, .9, .5, 0.4);
+            expandRing(g, 5, 8, l -> { dustAt(l, 255, 215, 90, 1.8f, 1, 0.05); sp(w, Particle.END_ROD, l, 1); });
+            column(g, 10, l -> dustAt(l, 255, 230, 120, 1.6f, 2, 0.3));
+            w.playSound(g, Sound.ITEM_TRIDENT_THUNDER, 1.2f, 1.2f);
             new BukkitRunnable() {
                 int n = 0;
                 @Override public void run() {
@@ -457,6 +506,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                     Vector v = p.getLocation().toVector().subtract(t.getLocation().toVector());
                     if (v.length() < 2.5) { cancel(); return; }
                     t.setVelocity(v.normalize().multiply(1.1).setY(0.25));   // pull toward the wielder
+                    beam(t.getLocation().add(0, 1, 0), p.getLocation().add(0, 1, 0), 0.7, l -> { sp(w, Particle.END_ROD, l, 1); dustAt(l, 255, 215, 90, 1.2f, 1, 0.05); });
                 }
             }.runTaskTimer(this, 0, 1);
         });
@@ -471,12 +521,18 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 if (!cd(p, "final_verdict", 30, true)) { airHits.put(u, 5); return; }   // wait for cooldown, keep the charge
                 Location l = v.getLocation();
                 e.setDamage(e.getDamage() * 2);
-                l.getWorld().spawnParticle(Particle.EXPLOSION_EMITTER, l, 1);
+                World fw = l.getWorld();
+                sp(fw, Particle.EXPLOSION_EMITTER, l, 1);
+                sp(fw, Particle.END_ROD, l.clone().add(0, 1, 0), 80, 1.5, 1, 1.5, 0.35);
+                sp(fw, Particle.TOTEM_OF_UNDYING, l.clone().add(0, 1, 0), 60, 1.2, 1, 1.2, 0.5);
+                expandRing(l, 6, 10, x -> { dustAt(x, 255, 215, 90, 2f, 1, 0.05); sp(fw, Particle.FLAME, x, 1); });
+                column(l, 12, x -> dustAt(x, 255, 230, 120, 1.8f, 3, 0.4));
+                fw.strikeLightningEffect(l);
                 l.getWorld().playSound(l, Sound.ENTITY_GENERIC_EXPLODE, 1.2f, 1f);
                 for (Entity en : v.getNearbyEntities(3, 3, 3))
                     if (en instanceof LivingEntity le && en != p && !(en instanceof ArmorStand)) drainAllArmor(le, 60);
                 drainAllArmor(v, 60);
-                p.sendActionBar(Component.text("FINAL VERDICT", NamedTextColor.GOLD));
+                msg(p, Component.text("FINAL VERDICT", NamedTextColor.GOLD));
                 airHits.remove(u);
                 return;
             }
@@ -484,8 +540,14 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             e.setDamage(e.getDamage() * 2);
             v.addPotionEffect(new PotionEffect(PotionEffectType.WITHER, 400, 1));
             v.addPotionEffect(new PotionEffect(PotionEffectType.POISON, 400, 1));
-            v.getWorld().spawnParticle(Particle.REVERSE_PORTAL, v.getLocation().add(0, 1, 0), 60, .4, .8, .4);
-            p.sendActionBar(Component.text("VOID STRIKE", NamedTextColor.DARK_PURPLE));
+            World vw = v.getWorld(); Location vl = v.getLocation();
+            sp(vw, Particle.REVERSE_PORTAL, vl.clone().add(0, 1, 0), 90, .5, .9, .5, 0.6);
+            sp(vw, Particle.DRAGON_BREATH, vl.clone().add(0, 1, 0), 40, .5, .9, .5, 0.05);
+            expandRing(vl, 5, 10, x -> { dustAt(x, 150, 60, 255, 1.9f, 1, 0.05); sp(vw, Particle.PORTAL, x, 2, .1, .3, .1, 0.4); });
+            column(vl, 10, x -> dustAt(x, 190, 120, 255, 1.7f, 3, 0.35));
+            vw.playSound(vl, Sound.ENTITY_ENDERMAN_TELEPORT, 1.2f, 0.5f);
+            vw.playSound(vl, Sound.ENTITY_WITHER_HURT, 0.8f, 0.6f);
+            msg(p, Component.text("VOID STRIKE", NamedTextColor.DARK_PURPLE));
             airHits.remove(u);
             return;
         }
@@ -511,19 +573,23 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             int n = 0;
             @Override public void run() {
                 if (!d.isValid()) { cancel(); return; }
-                if (n++ > 24) { th.land = pos.clone(); th.landed = true; p.sendActionBar(Component.text("Right-click to teleport to the mace", NamedTextColor.LIGHT_PURPLE)); cancel(); return; }
+                if (n++ > 24) { th.land = pos.clone(); th.landed = true; msg(p, Component.text("Right-click to teleport to the mace", NamedTextColor.LIGHT_PURPLE)); cancel(); return; }
                 RayTraceResult r = pos.getWorld().rayTrace(pos, dir, 1.7, FluidCollisionMode.NEVER, true, 0.4,
                         en -> en != p && en instanceof LivingEntity && !(en instanceof ArmorStand));
                 if (r != null) {
                     double dist = Math.max(0, pos.toVector().distance(r.getHitPosition()) - 0.8);
                     th.land = pos.clone().add(dir.clone().multiply(dist)); th.landed = true;
                     d.teleport(th.land);
-                    p.sendActionBar(Component.text("Right-click to teleport to the mace", NamedTextColor.LIGHT_PURPLE));
+                    expandRing(th.land.clone().add(0, -1, 0), 3, 8, x -> dustAt(x, 150, 60, 255, 1.6f, 1, 0.05));
+                    sp(d.getWorld(), Particle.PORTAL, th.land, 50, .4, .4, .4, 0.8);
+                    msg(p, Component.text("Right-click to teleport to the mace", NamedTextColor.LIGHT_PURPLE));
                     cancel(); return;
                 }
                 pos.add(dir.clone().multiply(1.7));
                 d.teleport(pos);
-                d.getWorld().spawnParticle(Particle.PORTAL, pos, 6, .1, .1, .1, .2);
+                sp(d.getWorld(), Particle.PORTAL, pos, 8, .15, .15, .15, .3);
+                dustAt(pos, 150, 60, 255, 1.6f, 3, 0.15);
+                sp(d.getWorld(), Particle.REVERSE_PORTAL, pos, 2, .1, .1, .1, 0.05);
             }
         }.runTaskTimer(this, 0, 1);
         Bukkit.getScheduler().runTaskLater(this, () -> {
@@ -546,7 +612,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             int next = cur >= 3 ? 1 : cur + 1;
             it.addUnsafeEnchantment(Enchantment.WIND_BURST, next);
             p.getInventory().setItemInMainHand(it);
-            p.sendActionBar(Component.text("Wind Burst " + next, NamedTextColor.AQUA));
+            msg(p, Component.text("Wind Burst " + next, NamedTextColor.AQUA));
             p.playSound(p.getLocation(), Sound.BLOCK_NOTE_BLOCK_CHIME, 1f, 0.8f + next * 0.2f);
             return;
         }
@@ -554,7 +620,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             Thrown th = thrown.get(p.getUniqueId());
             if (th == null) return;
             e.setCancelled(true);
-            if (!th.landed) { p.sendActionBar(Component.text("The mace is still flying", NamedTextColor.GRAY)); return; }
+            if (!th.landed) { msg(p, Component.text("The mace is still flying", NamedTextColor.GRAY)); return; }
             Location dest = null;
             for (double dy = -1.6; dy <= 0.01; dy += 0.2) {
                 Location c = th.land.clone().add(0, dy, 0);
@@ -562,11 +628,15 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             }
             thrown.remove(p.getUniqueId());
             if (th.disp != null && th.disp.isValid()) th.disp.remove();
-            if (dest == null) { p.sendActionBar(Component.text("No safe spot at the mace", NamedTextColor.RED)); return; }
+            if (dest == null) { msg(p, Component.text("No safe spot at the mace", NamedTextColor.RED)); return; }
             dest.setYaw(p.getLocation().getYaw()); dest.setPitch(p.getLocation().getPitch());
-            p.getWorld().spawnParticle(Particle.PORTAL, p.getLocation().add(0, 1, 0), 60, .4, .8, .4);
+            sp(p.getWorld(), Particle.PORTAL, p.getLocation().add(0, 1, 0), 60, .4, .8, .4);
+            Location from = p.getLocation().add(0, 1, 0), to = dest.clone().add(0, 1, 0);
+            beam(from, to, 0.3, l -> { dustAt(l, 150, 60, 255, 1.4f, 1, 0.12); sp(p.getWorld(), Particle.REVERSE_PORTAL, l, 2, .15, .15, .15, 0.05); });
+            expandRing(p.getLocation(), 3, 6, l -> dustAt(l, 150, 60, 255, 1.5f, 1, 0.05));
             p.teleport(dest);
-            p.getWorld().spawnParticle(Particle.REVERSE_PORTAL, dest.clone().add(0, 1, 0), 60, .4, .8, .4);
+            expandRing(dest, 3, 6, l -> dustAt(l, 190, 120, 255, 1.5f, 1, 0.05));
+            sp(p.getWorld(), Particle.REVERSE_PORTAL, dest.clone().add(0, 1, 0), 80, .4, .8, .4, 0.4);
             p.getWorld().playSound(dest, Sound.ENTITY_ENDERMAN_TELEPORT, 1f, 0.8f);
         }
     }
@@ -590,7 +660,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 double r = maxR * (n + 1) / 20.0;
                 for (int i = 0; i < 72; i++) {
                     double a = i * Math.PI * 2 / 72;
-                    c.getWorld().spawnParticle(particle, c.clone().add(Math.cos(a) * r, 0.3, Math.sin(a) * r), 1, 0, 0, 0, 0);
+                    sp(c.getWorld(), particle, c.clone().add(Math.cos(a) * r, 0.3, Math.sin(a) * r), 1, 0, 0, 0, 0);
                 }
                 if (++n >= 20) cancel();
             }
@@ -611,11 +681,23 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         }
         p.getWorld().playSound(c, Sound.ENTITY_ENDER_DRAGON_GROWL, 1.2f, 0.5f);
         ring(c, r, Particle.END_ROD);
-        p.sendActionBar(Component.text("TEMPORAL CLEAVE - time is shattered", NamedTextColor.GREEN));
+        World cw = c.getWorld();
+        expandRing(c, r, 20, l -> { dustAt(l, 50, 230, 100, 1.8f, 1, 0.05); dustAt(l, 255, 205, 60, 1.3f, 1, 0.05); });
+        for (int i = 0; i < 12; i++) {      // clock marks around the holder
+            double a = i * Math.PI / 6;
+            Location mark = c.clone().add(Math.cos(a) * 6, 0, Math.sin(a) * 6);
+            column(mark, i % 3 == 0 ? 4 : 2, l -> dustAt(l, 255, 205, 60, 1.4f, 1, 0.05));
+        }
+        sp(cw, Particle.END_ROD, c.clone().add(0, 1, 0), 120, 3, 2, 3, 0.2);
+        msg(p, Component.text("TEMPORAL CLEAVE - time is shattered", NamedTextColor.GREEN));
         new BukkitRunnable() {
             int n = 0;
             @Override public void run() {
                 for (Projectile pr : proj.keySet()) if (pr.isValid()) pr.setVelocity(new Vector());
+                for (LivingEntity fe : frozen) if (fe.isValid()) {
+                    dustAt(fe.getEyeLocation().add(0, 0.7, 0), 50, 230, 100, 1.1f, 1, 0.25);
+                    if (n % 5 == 0) sp(fe.getWorld(), Particle.END_ROD, fe.getLocation().add(0, 1, 0), 3, .3, .6, .3, 0.01);
+                }
                 if (++n * 2 >= ticks) {
                     cancel();
                     for (LivingEntity le : frozen) if (le.isValid()) unstun(le);
@@ -633,7 +715,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     void temporalDismember(Player p) {
         int range = getConfig().getInt("temporal-dismemberment.range", 25);
         LivingEntity t = lookTarget(p, range);
-        if (t == null) { p.sendActionBar(Component.text("No target in sight", NamedTextColor.GRAY)); return; }
+        if (t == null) { msg(p, Component.text("No target in sight", NamedTextColor.GRAY)); return; }
         if (!cd(p, "temporal_dismemberment", 120)) return;
         double cloneDmg = getConfig().getDouble("temporal-dismemberment.clone-damage-hearts", 1.5) * 2;
         double eraseDmg = getConfig().getDouble("temporal-dismemberment.erasure-damage-hearts", 3.0) * 2;
@@ -642,7 +724,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
         // Phase 1 + 2: frozen for 10 seconds (blocks movement, teleports, pearls, wind charges)
         stun(t, 200);
-        p.sendActionBar(Component.text("TEMPORAL DISMEMBERMENT - lock on", NamedTextColor.DARK_GREEN));
+        msg(p, Component.text("TEMPORAL DISMEMBERMENT - lock on", NamedTextColor.DARK_GREEN));
         new BukkitRunnable() {   // rotating sigil, phase 1 (5s)
             int n = 0;
             @Override public void run() {
@@ -653,10 +735,12 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                     double ang = a + k * Math.PI / 4;
                     for (double rr : new double[]{1.2 + n * 0.03, 2.2 + n * 0.03}) {
                         Location l = base.clone().add(Math.cos(ang) * rr, 0, Math.sin(ang) * rr);
-                        l.getWorld().spawnParticle(Particle.DRAGON_BREATH, l, 1, 0, 0, 0, 0);
-                        l.getWorld().spawnParticle(Particle.PORTAL, l, 2, 0.05, 0.05, 0.05, 0.1);
+                        sp(l.getWorld(), Particle.DRAGON_BREATH, l, 1, 0, 0, 0, 0);
+                        dustAt(l, 50, 230, 100, 1.3f, 1, 0.03);
+                        sp(l.getWorld(), Particle.PORTAL, l, 2, 0.05, 0.05, 0.05, 0.1);
                     }
                 }
+                if (n % 5 == 0) column(base, 3, l -> dustAt(l, 255, 205, 60, 1.2f, 1, 0.5));
                 if (n % 10 == 0) t.getWorld().playSound(t.getLocation(), Sound.BLOCK_NOTE_BLOCK_CHIME, 1f, 0.5f + n / 60f);
                 n++;
             }
@@ -673,7 +757,9 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             if (!t.isValid() || t.isDead()) return;
             Location l = t.getLocation();
             l.getWorld().strikeLightningEffect(l);
-            l.getWorld().spawnParticle(Particle.END_ROD, l.clone().add(0, 1, 0), 80, .5, 1, .5, 0.2);
+            beam(l.clone().add(0, 25, 0), l, 0.4, x -> { dustAt(x, 255, 215, 80, 2f, 2, 0.2); dustAt(x, 50, 230, 100, 1.6f, 2, 0.3); sp(l.getWorld(), Particle.END_ROD, x, 1); });
+            expandRing(l, 6, 10, x -> { dustAt(x, 255, 205, 60, 1.8f, 1, 0.05); sp(l.getWorld(), Particle.END_ROD, x, 1); });
+            sp(l.getWorld(), Particle.END_ROD, l.clone().add(0, 1, 0), 80, .5, 1, .5, 0.2);
             l.getWorld().playSound(l, Sound.ENTITY_WARDEN_SONIC_BOOM, 1.5f, 0.6f);
             trueDamage(t, p, eraseDmg);
             Bukkit.getScheduler().runTaskLater(this, () -> {
@@ -681,9 +767,9 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 if (t.isDead() || !t.isValid()) {
                     Bukkit.broadcast(Component.text(t.getName() + " was erased from the timeline by " + p.getName(), NamedTextColor.GREEN));
                     World w = at.getWorld();
-                    w.spawnParticle(Particle.EXPLOSION_EMITTER, at, 4, 1, 1, 1);
-                    w.spawnParticle(Particle.DRAGON_BREATH, at.clone().add(0, 1, 0), 300, 2, 2, 2, 0.1);
-                    w.spawnParticle(Particle.END_ROD, at.clone().add(0, 1, 0), 200, 2, 2, 2, 0.3);
+                    sp(w, Particle.EXPLOSION_EMITTER, at, 4, 1, 1, 1);
+                    sp(w, Particle.DRAGON_BREATH, at.clone().add(0, 1, 0), 300, 2, 2, 2, 0.1);
+                    sp(w, Particle.END_ROD, at.clone().add(0, 1, 0), 200, 2, 2, 2, 0.3);
                     w.playSound(at, Sound.ENTITY_ENDER_DRAGON_DEATH, 1f, 1.2f);
                 } else {
                     marks.put(t.getUniqueId(), new Mark(p.getUniqueId(), System.currentTimeMillis() + markSec * 1000L, bonus));
@@ -692,7 +778,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                             PotionEffectType.SLOWNESS, PotionEffectType.DARKNESS, PotionEffectType.MINING_FATIGUE,
                             PotionEffectType.WITHER, PotionEffectType.HUNGER})
                         t.addPotionEffect(new PotionEffect(pt, mt, 0));
-                    p.sendActionBar(Component.text("Target MARKED (+" + (int) (bonus * 100) + "% damage)", NamedTextColor.GREEN));
+                    msg(p, Component.text("Target MARKED (+" + (int) (bonus * 100) + "% damage)", NamedTextColor.GREEN));
                 }
             }, 2L);
         }, 240L);
@@ -708,20 +794,20 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             a.getEquipment().setArmorContents(p.getInventory().getArmorContents());
             a.getEquipment().setItemInMainHand(p.getInventory().getItemInMainHand());
         });
-        loc.getWorld().spawnParticle(Particle.PORTAL, loc.clone().add(0, 1, 0), 40, .3, .8, .3, .3);
+        sp(loc.getWorld(), Particle.PORTAL, loc.clone().add(0, 1, 0), 40, .3, .8, .3, .3);
         Bukkit.getScheduler().runTaskLater(this, () -> {      // slash 1 deals the damage
             if (!t.isValid() || t.isDead()) return;
-            t.getWorld().spawnParticle(Particle.SWEEP_ATTACK, t.getLocation().add(0, 1, 0), 3, .4, .4, .4, 0);
+            sp(t.getWorld(), Particle.SWEEP_ATTACK, t.getLocation().add(0, 1, 0), 3, .4, .4, .4, 0);
             t.getWorld().playSound(t.getLocation(), Sound.ENTITY_PLAYER_ATTACK_SWEEP, 1f, 0.8f);
             trueDamage(t, p, dmg);
         }, 3L);
         Bukkit.getScheduler().runTaskLater(this, () -> {      // slash 2 is the afterimage
             if (!t.isValid()) return;
-            t.getWorld().spawnParticle(Particle.SWEEP_ATTACK, t.getLocation().add(0, 1.2, 0), 3, .4, .4, .4, 0);
-            t.getWorld().spawnParticle(Particle.END_ROD, loc.clone().add(0, 1, 0), 20, .3, .8, .3, 0.05);
+            sp(t.getWorld(), Particle.SWEEP_ATTACK, t.getLocation().add(0, 1.2, 0), 3, .4, .4, .4, 0);
+            sp(t.getWorld(), Particle.END_ROD, loc.clone().add(0, 1, 0), 20, .3, .8, .3, 0.05);
         }, 9L);
         Bukkit.getScheduler().runTaskLater(this, () -> {
-            loc.getWorld().spawnParticle(Particle.PORTAL, loc.clone().add(0, 1, 0), 30, .3, .8, .3, .3);
+            sp(loc.getWorld(), Particle.PORTAL, loc.clone().add(0, 1, 0), 30, .3, .8, .3, .3);
             as.remove();
         }, 16L);
     }
@@ -734,11 +820,13 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     // ---- Primal Bow
     void liveForTheHunt(Player p) {
-        if (huntReady.contains(p.getUniqueId())) { p.sendActionBar(Component.text("Your next arrow is already marked", NamedTextColor.GRAY)); return; }
+        if (huntReady.contains(p.getUniqueId())) { msg(p, Component.text("Your next arrow is already marked", NamedTextColor.GRAY)); return; }
         if (!cd(p, "live_for_the_hunt", 600)) return;
         huntReady.add(p.getUniqueId());
         p.getWorld().playSound(p.getLocation(), Sound.ENTITY_WOLF_HOWL, 1f, 0.8f);
-        p.sendActionBar(Component.text("LIVE FOR THE HUNT - next arrow is marked", NamedTextColor.AQUA));
+        expandRing(p.getLocation(), 6, 10, l -> { dustAt(l, 80, 225, 225, 1.7f, 1, 0.05); sp(p.getWorld(), Particle.HAPPY_VILLAGER, l, 1); });
+        auraTask(p, 80, l -> { dustAt(l, 80, 225, 225, 1.3f, 1, 0.05); sp(p.getWorld(), Particle.END_ROD, l, 1, 0, 0, 0, 0.01); });
+        msg(p, Component.text("LIVE FOR THE HUNT - next arrow is marked", NamedTextColor.AQUA));
     }
 
     @EventHandler(ignoreCancelled = true)
@@ -746,18 +834,26 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         if (!(e.getEntity() instanceof Player p) || !"primal_bow".equals(id(e.getBow()))) return;
         if (e.getProjectile() instanceof AbstractArrow a) {
             a.getPersistentDataContainer().set(PRIMAL_KEY, PersistentDataType.BYTE, (byte) 1);
-            if (huntReady.remove(p.getUniqueId())) a.getPersistentDataContainer().set(HUNT_KEY, PersistentDataType.BYTE, (byte) 1);
+            boolean hunt = huntReady.remove(p.getUniqueId());
+            if (hunt) a.getPersistentDataContainer().set(HUNT_KEY, PersistentDataType.BYTE, (byte) 1);
+            World aw = a.getWorld();
+            trail(a, l -> {
+                dustAt(l, 80, 225, 225, hunt ? 1.5f : 0.9f, hunt ? 3 : 1, hunt ? 0.1 : 0.02);
+                if (hunt) sp(aw, Particle.END_ROD, l, 1, .05, .05, .05, 0.01);
+            });
         }
         int max = getConfig().getInt("hunters-momentum-max", 30);
         int m = Math.min(max, momentum.getOrDefault(p.getUniqueId(), 0) + 1);
         momentum.put(p.getUniqueId(), m);
-        p.sendActionBar(Component.text("Hunter's Momentum +" + m, NamedTextColor.AQUA));
+        msg(p, Component.text("Hunter's Momentum +" + m, NamedTextColor.AQUA));
+        dustAt(p.getEyeLocation(), 80, 225, 225, 1.2f, 6 + m / 2, 0.5);
+        sp(p.getWorld(), Particle.HAPPY_VILLAGER, p.getLocation().add(0, 1, 0), 3 + m / 4, .5, .6, .5);
     }
 
     @EventHandler(ignoreCancelled = true)
     public void onHunterHurt(EntityDamageByEntityEvent e) {
         if (internal || !(e.getEntity() instanceof Player v)) return;
-        if (momentum.remove(v.getUniqueId()) != null) v.sendActionBar(Component.text("Hunter's Momentum lost", NamedTextColor.RED));
+        if (momentum.remove(v.getUniqueId()) != null) msg(v, Component.text("Hunter's Momentum lost", NamedTextColor.RED));
     }
 
     // ---- Mad Scientist's Crossbow
@@ -774,6 +870,11 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         a.addCustomEffect(new PotionEffect(t, 200, 1), true);
         a.setColor(t.getColor());
         a.getPersistentDataContainer().set(CROSS_KEY, PersistentDataType.BYTE, (byte) 1);
+        Color arrowColor = t.getColor(); World aw = a.getWorld();
+        trail(a, l -> {
+            sp(aw, Particle.DUST, l, 3, .06, .06, .06, 0, new Particle.DustOptions(arrowColor, 1.3f));
+            sp(aw, Particle.BUBBLE_POP, l, 1, .1, .1, .1, 0);
+        });
     }
 
     void grapplePull(LivingEntity v, Player p, double blocks) {
@@ -788,8 +889,12 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             if (!c.getBlock().getType().isSolid() && !c.clone().add(0, 1, 0).getBlock().getType().isSolid()) { dest = c; break; }
         }
         if (dest == null) return;
-        beamParticles(p.getEyeLocation().add(0, -0.2, 0), v.getLocation().add(0, 1, 0), Particle.CRIT);
+        World gw = v.getWorld();
+        beam(p.getEyeLocation().add(0, -0.2, 0), v.getLocation().add(0, 1, 0), 0.3, l -> { dustAt(l, 120, 255, 30, 1.5f, 1, 0.05); sp(gw, Particle.END_ROD, l, 1); });
+        sp(gw, Particle.CLOUD, v.getLocation().add(0, 1, 0), 20, .3, .5, .3, 0.05);
         v.teleport(dest);
+        sp(gw, Particle.CLOUD, dest.clone().add(0, 1, 0), 15, .3, .5, .3, 0.05);
+        gw.playSound(dest, Sound.ENTITY_FISHING_BOBBER_RETRIEVE, 1f, 0.7f);
     }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
@@ -797,6 +902,10 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         if (internal || !(e.getDamager() instanceof AbstractArrow a) || !(a.getShooter() instanceof Player p)
                 || !(e.getEntity() instanceof LivingEntity v)) return;
         PersistentDataContainer pdc = a.getPersistentDataContainer();
+        Location hl = v.getLocation().add(0, v.getHeight() / 2, 0); World hw = v.getWorld();
+        if (pdc.has(PRIMAL_KEY, PersistentDataType.BYTE)) { dustAt(hl, 80, 225, 225, 1.4f, 14, 0.4); sp(hw, Particle.HAPPY_VILLAGER, hl, 8, .4, .5, .4); }
+        if (pdc.has(HUNT_KEY, PersistentDataType.BYTE)) expandRing(v.getLocation(), 3, 8, l -> dustAt(l, 80, 225, 225, 1.5f, 1, 0.05));
+        if (pdc.has(CROSS_KEY, PersistentDataType.BYTE)) { dustAt(hl, 120, 255, 30, 1.4f, 16, 0.4); sp(hw, Particle.BUBBLE_POP, hl, 10, .4, .5, .4); }
         if (pdc.has(HUNT_KEY, PersistentDataType.BYTE)) {
             v.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING, 6000, 0));
             v.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 1200, 1));
@@ -813,7 +922,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     // ---- Royal Spear
     void royalJudgement(Player p) {
         LivingEntity t = lookTarget(p, 40);
-        if (t == null) { p.sendActionBar(Component.text("No target in sight", NamedTextColor.GRAY)); return; }
+        if (t == null) { msg(p, Component.text("No target in sight", NamedTextColor.GRAY)); return; }
         if (!cd(p, "royal_judgement", 60)) return;
         ItemStack spear = p.getInventory().getItemInMainHand().clone();
         Location start = p.getEyeLocation().add(p.getEyeLocation().getDirection());
@@ -831,13 +940,19 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                     t.addPotionEffect(new PotionEffect(PotionEffectType.WITHER, 400, 1));
                     t.addPotionEffect(new PotionEffect(PotionEffectType.POISON, 400, 1));
                     t.getWorld().playSound(t.getLocation(), Sound.ITEM_TRIDENT_HIT, 1f, 0.8f);
-                    t.getWorld().spawnParticle(Particle.CRIT, target, 30, .4, .5, .4);
+                    World iw = t.getWorld();
+                    sp(iw, Particle.CRIT, target, 40, .4, .5, .4, 0.4);
+                    sp(iw, Particle.TOTEM_OF_UNDYING, target, 30, .4, .5, .4, 0.4);
+                    sp(iw, Particle.SMOKE, target, 20, .4, .5, .4, 0.05);
+                    expandRing(t.getLocation(), 4, 8, x -> { dustAt(x, 255, 205, 60, 1.7f, 1, 0.05); dustAt(x, 130, 40, 150, 1.4f, 1, 0.05); });
+                    column(t.getLocation(), 6, x -> dustAt(x, 255, 215, 80, 1.5f, 2, 0.3));
                     return;
                 }
                 Location nl = d.getLocation().add(v.clone().normalize().multiply(1.8));
                 nl.setDirection(v);
                 d.teleport(nl);
-                d.getWorld().spawnParticle(Particle.END_ROD, nl, 2, 0.05, 0.05, 0.05, 0);
+                sp(d.getWorld(), Particle.END_ROD, nl, 3, 0.08, 0.08, 0.08, 0.02);
+                dustAt(nl, 255, 205, 60, 1.5f, 3, 0.12);
             }
         }.runTaskTimer(this, 0, 1);
     }
@@ -846,14 +961,23 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         if (!cd(p, "piercing_strike", 20)) return;
         Location eye = p.getEyeLocation(); Vector dir = eye.getDirection().normalize();
         Location end = eye.clone().add(dir.clone().multiply(30));
-        beamParticles(eye.clone().add(0, -0.2, 0), end, Particle.END_ROD);
+        World bw = p.getWorld(); Location start = eye.clone().add(0, -0.2, 0);
+        beam(start, end, 0.25, l -> { sp(bw, Particle.END_ROD, l, 1, 0.02, 0.02, 0.02, 0); dustAt(l, 255, 205, 60, 1.6f, 1, 0.04); });
+        helix(start, end, 0.7, 0.2, l -> dustAt(l, 140, 50, 190, 1.3f, 1, 0.02));
+        sp(bw, Particle.END_ROD, start, 20, .3, .3, .3, 0.2);
         p.getWorld().playSound(p.getLocation(), Sound.ENTITY_WARDEN_SONIC_BOOM, 0.8f, 1.6f);
         Location mid = eye.clone().add(dir.clone().multiply(15));
         for (Entity en : p.getWorld().getNearbyEntities(mid, 16, 16, 16)) {
             if (en == p || !(en instanceof LivingEntity le) || en instanceof ArmorStand) continue;
             BoundingBox box = en.getBoundingBox().expand(0.3);
             RayTraceResult r = box.rayTrace(eye.toVector(), dir, 30);
-            if (r != null) trueDamage(le, p, 8.0);           // goes through blocks: no block check
+            if (r != null) {                                  // goes through blocks: no block check
+                trueDamage(le, p, 8.0);
+                Location hl = le.getLocation().add(0, le.getHeight() / 2, 0);
+                sp(bw, Particle.END_ROD, hl, 40, .4, .5, .4, 0.4);
+                sp(bw, Particle.CRIT, hl, 30, .4, .5, .4, 0.5);
+                expandRing(le.getLocation(), 3, 6, x -> dustAt(x, 255, 205, 60, 1.6f, 1, 0.05));
+            }
         }
     }
 
@@ -873,6 +997,182 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     @EventHandler
     public void onJoinLunge(PlayerJoinEvent e) { setLunge(e.getPlayer(), true); }
 
+
+    // ------------------------------------------------------------------ visual effects + HUD
+    void sp(World w, Particle p, Location l, int n) { sp(w, p, l, n, 0, 0, 0, 0); }
+    void sp(World w, Particle p, Location l, int n, double dx, double dy, double dz) { sp(w, p, l, n, dx, dy, dz, 0); }
+    void sp(World w, Particle p, Location l, int n, double dx, double dy, double dz, double speed) {
+        try { w.spawnParticle(p, l, n, dx, dy, dz, speed); } catch (Exception ignored) { }
+    }
+    <T> void sp(World w, Particle p, Location l, int n, double dx, double dy, double dz, double speed, T data) {
+        try { w.spawnParticle(p, l, n, dx, dy, dz, speed, data); } catch (Exception ignored) { }
+    }
+
+    void dustAt(Location l, int r, int g, int b, float size, int n, double spread) {
+        sp(l.getWorld(), Particle.DUST, l, n, spread, spread, spread, 0, new Particle.DustOptions(Color.fromRGB(r, g, b), size));
+    }
+
+    void expandRing(Location c0, double maxR, int steps, Consumer<Location> plot) {
+        Location c = c0.clone();
+        new BukkitRunnable() {
+            int n = 0;
+            @Override public void run() {
+                double r = maxR * (n + 1) / steps;
+                int pts = (int) Math.max(16, r * 8);
+                for (int i = 0; i < pts; i++) {
+                    double a = i * Math.PI * 2 / pts;
+                    plot.accept(c.clone().add(Math.cos(a) * r, 0.2, Math.sin(a) * r));
+                }
+                if (++n >= steps) cancel();
+            }
+        }.runTaskTimer(this, 0, 1);
+    }
+
+    void auraTask(Player p, int ticks, Consumer<Location> plot) {
+        new BukkitRunnable() {
+            int n = 0;
+            @Override public void run() {
+                if (!p.isOnline() || n >= ticks) { cancel(); return; }
+                Location b = p.getLocation();
+                for (int k = 0; k < 2; k++) {
+                    double a = n * 0.45 + k * Math.PI, h = (n * 0.12 + k) % 2.0;
+                    plot.accept(b.clone().add(Math.cos(a) * 0.9, h, Math.sin(a) * 0.9));
+                }
+                n += 2;
+            }
+        }.runTaskTimer(this, 0, 2);
+    }
+
+    void beam(Location a, Location b, double step, Consumer<Location> plot) {
+        Vector d = b.toVector().subtract(a.toVector());
+        double len = d.length(); if (len < 0.01) return;
+        d.normalize();
+        for (double x = 0; x < len; x += step) plot.accept(a.clone().add(d.clone().multiply(x)));
+    }
+
+    void helix(Location a, Location b, double radius, double step, Consumer<Location> plot) {
+        Vector d = b.toVector().subtract(a.toVector());
+        double len = d.length(); if (len < 0.01) return;
+        d.normalize();
+        Vector u = d.clone().crossProduct(new Vector(0, 1, 0));
+        if (u.lengthSquared() < 1e-4) u = new Vector(1, 0, 0);
+        u.normalize();
+        Vector v = d.clone().crossProduct(u).normalize();
+        for (double x = 0; x < len; x += step) {
+            double ang = x * 2.2;
+            plot.accept(a.clone().add(d.clone().multiply(x)).add(u.clone().multiply(Math.cos(ang) * radius)).add(v.clone().multiply(Math.sin(ang) * radius)));
+        }
+    }
+
+    void trail(Entity e, Consumer<Location> plot) {
+        new BukkitRunnable() {
+            int n = 0;
+            @Override public void run() {
+                if (!e.isValid() || n++ > 400 || (e instanceof AbstractArrow a && a.isInBlock())) { cancel(); return; }
+                plot.accept(e.getLocation());
+            }
+        }.runTaskTimer(this, 0, 1);
+    }
+
+    void column(Location base, double height, Consumer<Location> plot) {
+        for (double y = 0; y < height; y += 0.4) plot.accept(base.clone().add(0, y, 0));
+    }
+
+    void hitFx(LivingEntity v, String id) {
+        World w = v.getWorld(); Location l = v.getLocation().add(0, v.getHeight() / 2, 0);
+        switch (id) {
+            case "bloody_eclipse" -> { dustAt(l, 190, 10, 20, 1.4f, 16, 0.4); sp(w, Particle.DAMAGE_INDICATOR, l, 5, .3, .4, .3); }
+            case "stormcaller" -> sp(w, Particle.ELECTRIC_SPARK, l, 28, .4, .5, .4, 0.4);
+            case "dwarven_pickaxe" -> { sp(w, Particle.BLOCK, l, 18, .3, .4, .3, 0, Material.STONE.createBlockData()); sp(w, Particle.CRIT, l, 8, .3, .4, .3, 0.2); }
+            case "ten_ton_axe" -> { sp(w, Particle.EXPLOSION, l, 1); sp(w, Particle.CRIT, l, 22, .4, .5, .4, 0.4); sp(w, Particle.CLOUD, l, 6, .3, .3, .3, 0.05); }
+            case "void_blade" -> { sp(w, Particle.PORTAL, l, 30, .4, .5, .4, 0.9); dustAt(l, 150, 60, 255, 1.4f, 10, 0.4); }
+            case "inferno" -> { sp(w, Particle.FLAME, l, 22, .3, .5, .3, 0.1); sp(w, Particle.LAVA, l, 4, .3, .4, .3); }
+            case "sculk_battle_axe" -> { sp(w, Particle.SCULK_SOUL, l, 7, .3, .5, .3, 0.04); dustAt(l, 30, 200, 230, 1.3f, 12, 0.4); }
+            case "royal_spear" -> { sp(w, Particle.END_ROD, l, 14, .3, .5, .3, 0.12); dustAt(l, 255, 205, 60, 1.3f, 14, 0.4); }
+            case "divine_judgement" -> { sp(w, Particle.END_ROD, l, 16, .3, .5, .3, 0.15); dustAt(l, 255, 220, 100, 1.5f, 12, 0.4); sp(w, Particle.TOTEM_OF_UNDYING, l, 6, .3, .5, .3, 0.2); }
+            case "hammer_of_the_void" -> { sp(w, Particle.REVERSE_PORTAL, l, 30, .4, .5, .4, 0.2); dustAt(l, 140, 50, 255, 1.5f, 10, 0.4); }
+            case "temporal_reaver" -> { dustAt(l, 50, 230, 100, 1.4f, 16, 0.4); sp(w, Particle.END_ROD, l, 8, .3, .5, .3, 0.1); dustAt(l, 255, 205, 60, 1.0f, 8, 0.4); }
+            default -> { }
+        }
+    }
+
+    void auraFx(Player p, String id) {
+        World w = p.getWorld(); Location b = p.getLocation(), h = p.getLocation().add(0, 1, 0);
+        switch (id) {
+            case "bloody_eclipse" -> dustAt(h, 170, 5, 15, 1.0f, 2, 0.6);
+            case "stormcaller" -> sp(w, Particle.ELECTRIC_SPARK, h, 2, .5, .7, .5, 0.1);
+            case "dwarven_pickaxe" -> sp(w, Particle.ENCHANT, h, 3, .5, .6, .5, 0.2);
+            case "ten_ton_axe" -> sp(w, Particle.SMOKE, b.clone().add(0, 0.2, 0), 2, .5, .1, .5, 0.01);
+            case "void_blade" -> { sp(w, Particle.PORTAL, h, 3, .5, .7, .5, 0.5); dustAt(h, 150, 60, 255, 0.9f, 1, 0.5); }
+            case "inferno" -> { sp(w, Particle.FLAME, b.clone().add(0, 0.1, 0), 3, .4, .05, .4, 0.03); sp(w, Particle.LAVA, h, 1, .4, .4, .4); }
+            case "sculk_battle_axe" -> { sp(w, Particle.SCULK_SOUL, h, 1, .5, .6, .5, 0.02); dustAt(h, 30, 200, 230, 0.9f, 1, 0.5); }
+            case "royal_spear", "divine_judgement" -> { sp(w, Particle.END_ROD, h, 1, .5, .7, .5, 0.01); dustAt(h, 255, 205, 60, 0.9f, 1, 0.5); }
+            case "hammer_of_the_void" -> { sp(w, Particle.PORTAL, h, 2, .5, .7, .5, 0.4); dustAt(h, 140, 50, 255, 0.9f, 1, 0.5); }
+            case "temporal_reaver" -> { dustAt(h, 50, 230, 100, 0.9f, 2, 0.6); dustAt(h, 255, 205, 60, 0.7f, 1, 0.6); }
+            case "primal_bow" -> dustAt(h, 80, 225, 225, 0.9f, 2, 0.6);
+            case "mad_scientists_crossbow" -> { dustAt(h, 120, 255, 30, 0.9f, 2, 0.6); sp(w, Particle.BUBBLE_POP, h, 1, .4, .6, .4, 0); }
+            default -> { }
+        }
+    }
+
+    void msg(Player p, Component c) {
+        holdUntil.put(p.getUniqueId(), System.currentTimeMillis() + 2500);
+        p.sendActionBar(c);
+    }
+
+    long remaining(Player p, String key) {
+        Long u = cooldowns.get(p.getUniqueId() + key);
+        long now = System.currentTimeMillis();
+        return (u == null || u <= now) ? 0 : (u - now + 999) / 1000;
+    }
+
+    String[][] abilitiesOf(String id) {
+        return switch (id) {
+            case "bloody_eclipse" -> new String[][]{{"F Bloodbath", "bloodbath"}, {"Shift+F Eclipse", "blinding_eclipse"}};
+            case "stormcaller" -> new String[][]{{"F Storm", "lightning_storm"}, {"Shift+F Tides", "tides_call"}};
+            case "dwarven_pickaxe" -> new String[][]{{"F Call of the Deep", "call_of_the_deep"}};
+            case "ten_ton_axe" -> new String[][]{{"F Stun", "stunning_strike"}, {"Shift+F Drain", "durability_drain"}};
+            case "void_blade" -> new String[][]{{"F Void Walk", "void_walk"}, {"Shift+F Pull", "pull_of_the_void"}};
+            case "inferno" -> new String[][]{{"F Acidic Blaze", "acidic_blaze"}, {"Shift+F Incinerate", "incineration"}};
+            case "sculk_battle_axe" -> new String[][]{{"F Beams", "sculk_beams"}, {"Shift+F Warden", "summon_warden"}};
+            case "royal_spear" -> new String[][]{{"F Judgement", "royal_judgement"}, {"Shift+F Pierce", "piercing_strike"}};
+            case "divine_judgement" -> new String[][]{{"F Smite", "smite"}, {"Verdict", "final_verdict"}};
+            case "hammer_of_the_void" -> new String[][]{{"F Throw", "void_throw"}};
+            case "temporal_reaver" -> new String[][]{{"F Cleave", "temporal_cleave"}, {"Shift+F Dismember", "temporal_dismemberment"}};
+            case "primal_bow" -> new String[][]{{"F Hunt", "live_for_the_hunt"}};
+            default -> new String[0][];
+        };
+    }
+
+    void hud(Player p, String id) {
+        if (!getConfig().getBoolean("cooldown-hud", true)) return;
+        Long hold = holdUntil.get(p.getUniqueId());
+        if (hold != null && hold > System.currentTimeMillis()) return;
+        String[][] abs = abilitiesOf(id);
+        if (abs.length == 0) return;
+        Component c = Component.empty();
+        for (int i = 0; i < abs.length; i++) {
+            if (i > 0) c = c.append(Component.text("  |  ", NamedTextColor.DARK_GRAY));
+            long rem = remaining(p, abs[i][1]);
+            c = c.append(rem > 0 ? Component.text(abs[i][0] + " " + rem + "s", NamedTextColor.RED)
+                                 : Component.text(abs[i][0] + " READY", NamedTextColor.GREEN));
+        }
+        long now = System.currentTimeMillis();
+        Long bb = bloodbath.get(p.getUniqueId());
+        if (id.equals("bloody_eclipse") && bb != null && bb > now) c = c.append(Component.text("   BLOODBATH " + ((bb - now) / 1000 + 1) + "s", NamedTextColor.GOLD));
+        if (id.equals("primal_bow")) {
+            if (huntReady.contains(p.getUniqueId())) c = c.append(Component.text("   ARMED", NamedTextColor.AQUA));
+            c = c.append(Component.text("   Momentum x" + momentum.getOrDefault(p.getUniqueId(), 0), NamedTextColor.DARK_AQUA));
+        }
+        if (id.equals("hammer_of_the_void")) {
+            Thrown th = thrown.get(p.getUniqueId());
+            if (th != null && th.landed) c = c.append(Component.text("   RIGHT-CLICK to teleport", NamedTextColor.LIGHT_PURPLE));
+        }
+        if (id.equals("divine_judgement") || id.equals("hammer_of_the_void"))
+            c = c.append(Component.text("   Air hits " + airHits.getOrDefault(p.getUniqueId(), 0), NamedTextColor.GRAY));
+        p.sendActionBar(c);
+    }
+
     // ------------------------------------------------------------------ passives
     void passives(Player p) {
         ItemStack helm = p.getInventory().getHelmet();
@@ -889,7 +1189,8 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 effect(p, PotionEffectType.CONDUIT_POWER, 0); }
             case "void_blade" -> { effect(p, PotionEffectType.SPEED, 2); effect(p, PotionEffectType.STRENGTH, 0);
                 effect(p, PotionEffectType.FIRE_RESISTANCE, 0); }
-            case "skulk_battle_axe" -> { effect(p, PotionEffectType.STRENGTH, 0); effect(p, PotionEffectType.SPEED, 1);
+            case "inferno" -> effect(p, PotionEffectType.FIRE_RESISTANCE, 0);
+            case "sculk_battle_axe" -> { effect(p, PotionEffectType.STRENGTH, 0); effect(p, PotionEffectType.SPEED, 1);
                 effect(p, PotionEffectType.RESISTANCE, 0); }
             case "royal_spear" -> { effect(p, PotionEffectType.SPEED, 1);
                 Long u = lungeCd.get(p.getUniqueId());
@@ -914,7 +1215,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "ten_ton_axe" -> { if (sh) durabilityDrain(p); else stunningStrike(p); }
             case "void_blade" -> { if (sh) pullOfTheVoid(p); else voidWalk(p); }
             case "inferno" -> { if (sh) incinerate(p); else acidicBlaze(p); }
-            case "skulk_battle_axe" -> { if (sh) summonWarden(p); else sculkBeams(p); }
+            case "sculk_battle_axe" -> { if (sh) summonWarden(p); else sculkBeams(p); }
             case "royal_spear" -> { if (sh) piercingStrike(p); else royalJudgement(p); }
             case "temporal_reaver" -> { if (sh) temporalDismember(p); else temporalCleave(p); }
             case "primal_bow" -> { if (!sh) liveForTheHunt(p); }
@@ -928,21 +1229,42 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     void bloodbath(Player p) {
         if (!cd(p, "bloodbath", 45)) return;
         bloodbath.put(p.getUniqueId(), System.currentTimeMillis() + 10_000);
-        p.getWorld().playSound(p.getLocation(), Sound.ENTITY_WITHER_SPAWN, 0.6f, 1.6f);
-        p.sendActionBar(Component.text("BLOODBATH! Every hit crits for 10s", NamedTextColor.DARK_RED));
+        World w = p.getWorld(); Location c = p.getLocation();
+        w.playSound(c, Sound.ENTITY_WITHER_SPAWN, 0.6f, 1.6f);
+        w.playSound(c, Sound.ENTITY_GENERIC_EXPLODE, 0.5f, 0.6f);
+        expandRing(c, 7, 12, l -> { dustAt(l, 200, 10, 20, 1.7f, 1, 0.05); sp(w, Particle.DAMAGE_INDICATOR, l, 1); });
+        column(c, 4, l -> dustAt(l, 150, 0, 10, 1.5f, 3, 0.4));
+        auraTask(p, 200, l -> { dustAt(l, 210, 15, 25, 1.3f, 1, 0.05); sp(w, Particle.DAMAGE_INDICATOR, l, 1); });
+        msg(p, Component.text("BLOODBATH! Every hit crits for 10s", NamedTextColor.DARK_RED));
     }
 
     void blindingEclipse(Player p) {
         if (!cd(p, "blinding_eclipse", 60)) return;
         long end = System.currentTimeMillis() + 10_000;
+        World w = p.getWorld(); Location c = p.getLocation();
         for (Entity en : p.getNearbyEntities(20, 20, 20)) {
             if (!(en instanceof LivingEntity le) || en instanceof ArmorStand) continue;
-            if (en.getLocation().distanceSquared(p.getLocation()) > 400) continue;
+            if (en.getLocation().distanceSquared(c) > 400) continue;
             le.addPotionEffect(new PotionEffect(PotionEffectType.BLINDNESS, 200, 0));
+            sp(w, Particle.SQUID_INK, le.getEyeLocation(), 16, .3, .3, .3, 0.05);
             if (en instanceof Player v) eclipsed.put(v.getUniqueId(), end);
         }
-        p.getWorld().playSound(p.getLocation(), Sound.ENTITY_ENDER_DRAGON_GROWL, 0.7f, 0.6f);
-        p.sendActionBar(Component.text("BLINDING ECLIPSE", NamedTextColor.DARK_PURPLE));
+        w.playSound(c, Sound.ENTITY_ENDER_DRAGON_GROWL, 0.7f, 0.6f);
+        expandRing(c, 20, 20, l -> { dustAt(l, 20, 0, 40, 2.2f, 1, 0.1); sp(w, Particle.SMOKE, l, 1, .1, .6, .1, 0.02); });
+        expandRing(c.clone().add(0, 3, 0), 20, 20, l -> sp(w, Particle.SQUID_INK, l, 1));
+        new BukkitRunnable() {          // black sun with a fiery corona above the holder
+            int n = 0;
+            @Override public void run() {
+                if (!p.isOnline() || n++ > 30) { cancel(); return; }
+                Location top = p.getLocation().add(0, 7, 0);
+                for (int i = 0; i < 28; i++) {
+                    double a = i * Math.PI * 2 / 28 + n * 0.1;
+                    dustAt(top.clone().add(Math.cos(a) * 2.6, Math.sin(a) * 2.6 * 0.3, Math.sin(a) * 2.6), 255, 90, 20, 1.2f, 1, 0.02);
+                }
+                for (int i = 0; i < 10; i++) dustAt(top.clone().add((Math.random() - .5) * 4, (Math.random() - .5) * 1.2, (Math.random() - .5) * 4), 5, 0, 10, 2f, 1, 0.1);
+            }
+        }.runTaskTimer(this, 0, 2);
+        msg(p, Component.text("BLINDING ECLIPSE", NamedTextColor.DARK_PURPLE));
     }
 
     boolean isEclipsed(Player p) {
@@ -956,7 +1278,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     public void onWindCharge(ProjectileLaunchEvent e) {
         if (e.getEntity() instanceof WindCharge w && w.getShooter() instanceof Player p && isEclipsed(p)) {
             e.setCancelled(true);
-            p.sendActionBar(Component.text("Wind charges are disabled by the eclipse!", NamedTextColor.RED));
+            msg(p, Component.text("Wind charges are disabled by the eclipse!", NamedTextColor.RED));
         }
     }
 
@@ -964,7 +1286,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     public void onCobweb(BlockPlaceEvent e) {
         if (e.getBlock().getType() == Material.COBWEB && isEclipsed(e.getPlayer())) {
             e.setCancelled(true);
-            e.getPlayer().sendActionBar(Component.text("Cobwebs are disabled by the eclipse!", NamedTextColor.RED));
+            msg(e.getPlayer(), Component.text("Cobwebs are disabled by the eclipse!", NamedTextColor.RED));
         }
     }
 
@@ -974,44 +1296,65 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             @Override public void run() {
                 if (!v.isValid() || v.isDead() || n++ >= 5) { cancel(); return; }
                 trueDamage(v, null, 1.0);
-                v.getWorld().spawnParticle(Particle.DAMAGE_INDICATOR, v.getLocation().add(0, 1, 0), 6, .3, .4, .3);
+                sp(v.getWorld(), Particle.DAMAGE_INDICATOR, v.getLocation().add(0, 1, 0), 6, .3, .4, .3);
             }
         }.runTaskTimer(this, 20, 20);
-        if (src != null) src.sendActionBar(Component.text("Bleed applied", NamedTextColor.RED));
+        if (src != null) msg(src, Component.text("Bleed applied", NamedTextColor.RED));
     }
 
     // ---- Stormcaller
     void lightningStorm(Player p) {
         LivingEntity t = lookTarget(p, 30);
-        if (t == null) { p.sendActionBar(Component.text("No target in sight", NamedTextColor.GRAY)); return; }
+        if (t == null) { msg(p, Component.text("No target in sight", NamedTextColor.GRAY)); return; }
         if (!cd(p, "lightning_storm", 30)) return;
+        World w = t.getWorld();
+        new BukkitRunnable() {          // dark storm cloud over the target
+            int n = 0;
+            @Override public void run() {
+                if (!t.isValid() || n++ > 9) { cancel(); return; }
+                Location top = t.getLocation().add(0, 12, 0);
+                for (int i = 0; i < 30; i++)
+                    dustAt(top.clone().add((Math.random() - .5) * 8, (Math.random() - .5) * 1.2, (Math.random() - .5) * 8), 60, 70, 90, 2.4f, 1, 0.1);
+                sp(w, Particle.ELECTRIC_SPARK, top, 6, 3, 0.5, 3, 0.2);
+            }
+        }.runTaskTimer(this, 0, 2);
         for (int i = 0; i < 3; i++) {
             Bukkit.getScheduler().runTaskLater(this, () -> {
                 if (!t.isValid() || t.isDead()) return;
-                t.getWorld().strikeLightningEffect(t.getLocation());
+                Location g = t.getLocation();
+                beam(g.clone().add(0, 14, 0), g, 0.4, l -> { sp(w, Particle.ELECTRIC_SPARK, l, 3, .25, .1, .25, 0.1); dustAt(l, 150, 220, 255, 1.5f, 1, 0.15); });
+                w.strikeLightningEffect(g);
+                sp(w, Particle.ELECTRIC_SPARK, g.clone().add(0, 1, 0), 70, .6, .9, .6, 0.7);
+                sp(w, Particle.SPLASH, g.clone().add(0, 0.3, 0), 30, .6, .1, .6, 0.2);
+                expandRing(g, 4, 6, l -> sp(w, Particle.ELECTRIC_SPARK, l, 1));
                 trueDamage(t, p, 4.0);
-            }, i * 6L);
+            }, 20L + i * 6L);
         }
     }
 
     void tidesCall(Player p) {
         if (!cd(p, "tides_call", 40)) return;
-        p.getWorld().playSound(p.getLocation(), Sound.ITEM_TRIDENT_THUNDER, 1f, 0.7f);
+        World w = p.getWorld();
+        w.playSound(p.getLocation(), Sound.ITEM_TRIDENT_THUNDER, 1f, 0.7f);
+        w.playSound(p.getLocation(), Sound.ENTITY_DOLPHIN_SPLASH, 1.5f, 0.6f);
+        expandRing(p.getLocation(), 20, 14, l -> { sp(w, Particle.SPLASH, l, 6, .2, .3, .2); sp(w, Particle.BUBBLE_POP, l, 2, .2, .3, .2); });
+        auraTask(p, 200, l -> { sp(w, Particle.SPLASH, l, 6, .15, .15, .15); sp(w, Particle.BUBBLE_POP, l, 2, .1, .1, .1); });
         new BukkitRunnable() {
             int n = 0;
             @Override public void run() {
-                if (!p.isOnline() || n++ >= 50) { cancel(); return; }
+                if (!p.isOnline() || n++ >= 100) { cancel(); return; }
                 for (Entity en : p.getNearbyEntities(20, 20, 20)) {
                     if (!(en instanceof LivingEntity le) || en instanceof ArmorStand) continue;
                     if (en.getLocation().distanceSquared(p.getLocation()) > 400) continue;
                     Vector v = p.getLocation().toVector().subtract(en.getLocation().toVector());
-                    if (v.lengthSquared() > 4) en.setVelocity(en.getVelocity().add(v.normalize().multiply(0.12).setY(0.02)));
+                    if (v.lengthSquared() > 9) en.setVelocity(v.normalize().multiply(0.7).setY(0.12));   // fast pull
                     if (!(en instanceof WaterMob) && !(en instanceof Drowned) && !le.hasPotionEffect(PotionEffectType.WATER_BREATHING))
-                        le.setRemainingAir(Math.max(-20, le.getRemainingAir() - 20));
-                    en.getWorld().spawnParticle(Particle.BUBBLE_POP, en.getLocation().add(0, 1, 0), 6, .3, .5, .3);
+                        le.setRemainingAir(Math.max(-20, le.getRemainingAir() - 12));
+                    sp(w, Particle.BUBBLE_POP, en.getLocation().add(0, 1, 0), 5, .3, .5, .3);
+                    if (n % 3 == 0) beam(en.getLocation().add(0, 1, 0), p.getLocation().add(0, 1, 0), 1.3, l -> sp(w, Particle.BUBBLE_POP, l, 1));
                 }
             }
-        }.runTaskTimer(this, 0, 4);
+        }.runTaskTimer(this, 0, 2);
     }
 
     // ---- Dwarven Pickaxe
@@ -1032,12 +1375,36 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             b.setType(rnd.nextBoolean() ? Material.DIRT : Material.STONE, false);
             dome.put(b, Material.AIR); placed.add(b);
         }
+        // floor (3 layers, only over air) under the dome - unbreakable, same as the walls
+        for (int dx = -R; dx <= R; dx++) for (int dz = -R; dz <= R; dz++) {
+            if (dx * dx + dz * dz > R * R) continue;
+            for (int layer = 1; layer <= 3; layer++) {
+                int by = c.getBlockY() - layer;
+                if (by < w.getMinHeight()) break;
+                int bx = c.getBlockX() + dx, bz = c.getBlockZ() + dz;
+                if (!w.isChunkLoaded(bx >> 4, bz >> 4)) break;
+                Block fb = w.getBlockAt(bx, by, bz);
+                if (!fb.getType().isAir()) continue;
+                Material fm = rnd.nextBoolean() ? Material.DIRT : Material.STONE;
+                fb.setType(fm, false);
+                dome.put(fb, Material.AIR); placed.add(fb);        // unbreakable like the dome walls; removed with the dome
+            }
+        }
         w.playSound(c, Sound.BLOCK_ANVIL_LAND, 1f, 0.5f);
-        p.sendActionBar(Component.text("CALL OF THE DEEP", NamedTextColor.GRAY));
+        w.playSound(c, Sound.ENTITY_GENERIC_EXPLODE, 1f, 0.5f);
+        for (int i = 0; i < placed.size(); i += 3)
+            sp(w, Particle.BLOCK, placed.get(i).getLocation().add(0.5, 0.5, 0.5), 6, .4, .4, .4, 0, (i % 2 == 0 ? Material.DIRT : Material.STONE).createBlockData());
+        expandRing(c, R, 16, l -> { sp(w, Particle.CLOUD, l, 2, .3, .2, .3, 0.02); sp(w, Particle.BLOCK, l, 3, .3, .2, .3, 0, Material.STONE.createBlockData()); });
+        column(c, 6, l -> sp(w, Particle.CLOUD, l, 2, .5, .1, .5, 0.02));
+        msg(p, Component.text("CALL OF THE DEEP", NamedTextColor.GRAY));
         Bukkit.getScheduler().runTaskLater(this, () -> {
             for (Block b : placed) {
                 Material t = b.getType();
                 if (dome.remove(b) != null && (t == Material.DIRT || t == Material.STONE)) b.setType(Material.AIR, false);
+            }
+            for (Block b : new ArrayList<>(domeFloor.keySet())) {
+                Material placedType = domeFloor.remove(b);
+                if (b.getType() == placedType) b.setType(Material.AIR, false);     // only if nobody replaced it
             }
         }, 1200L);
     }
@@ -1116,17 +1483,33 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     void stunningStrike(Player p) {
         LivingEntity t = lookTarget(p, 6);
-        if (t == null) { p.sendActionBar(Component.text("No target in reach", NamedTextColor.GRAY)); return; }
+        if (t == null) { msg(p, Component.text("No target in reach", NamedTextColor.GRAY)); return; }
         if (!cd(p, "stunning_strike", 30)) return;
         stun(t, 100);
         trueDamage(t, p, 4.0);
-        t.getWorld().playSound(t.getLocation(), Sound.ENTITY_IRON_GOLEM_ATTACK, 1f, 0.6f);
-        t.getWorld().spawnParticle(Particle.CRIT, t.getLocation().add(0, 1, 0), 30, .4, .5, .4);
+        World w = t.getWorld(); Location g = t.getLocation();
+        w.playSound(g, Sound.ENTITY_IRON_GOLEM_ATTACK, 1f, 0.6f);
+        w.playSound(g, Sound.ENTITY_GENERIC_EXPLODE, 0.8f, 1.4f);
+        sp(w, Particle.EXPLOSION, g.clone().add(0, 1, 0), 2, .3, .3, .3);
+        sp(w, Particle.CRIT, g.clone().add(0, 1, 0), 50, .5, .6, .5, 0.5);
+        expandRing(g, 5, 8, l -> { sp(w, Particle.CLOUD, l, 2, .2, .1, .2, 0.02); sp(w, Particle.CRIT, l, 1); });
+        new BukkitRunnable() {          // stars circling the stunned target's head
+            int n = 0;
+            @Override public void run() {
+                if (!t.isValid() || n++ >= 25) { cancel(); return; }
+                Location head = t.getEyeLocation().add(0, 0.5, 0);
+                for (int i = 0; i < 4; i++) {
+                    double a = n * 0.5 + i * Math.PI / 2;
+                    sp(w, Particle.CRIT, head.clone().add(Math.cos(a) * 0.7, 0, Math.sin(a) * 0.7), 1);
+                    dustAt(head.clone().add(Math.cos(a) * 0.7, 0.1, Math.sin(a) * 0.7), 255, 230, 80, 1.0f, 1, 0.02);
+                }
+            }
+        }.runTaskTimer(this, 0, 4);
     }
 
     void durabilityDrain(Player p) {
         LivingEntity t = lookTarget(p, 6);
-        if (t == null) { p.sendActionBar(Component.text("No target in reach", NamedTextColor.GRAY)); return; }
+        if (t == null) { msg(p, Component.text("No target in reach", NamedTextColor.GRAY)); return; }
         if (!cd(p, "durability_drain", 60)) return;
         trueDamage(t, p, 4.0);
         EntityEquipment eq = t.getEquipment();
@@ -1148,6 +1531,10 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             }
         }
         t.getWorld().playSound(t.getLocation(), Sound.BLOCK_ANVIL_PLACE, 1f, 0.8f);
+        Location mid = t.getLocation().add(0, 1.2, 0);
+        sp(t.getWorld(), Particle.ITEM, mid, 40, .4, .6, .4, 0.15, new ItemStack(Material.NETHERITE_CHESTPLATE));
+        sp(t.getWorld(), Particle.CRIT, mid, 30, .4, .6, .4, 0.4);
+        expandRing(t.getLocation(), 3, 6, l -> sp(t.getWorld(), Particle.ENCHANTED_HIT, l, 2, .1, .3, .1, 0.1));
     }
 
     @EventHandler
@@ -1175,9 +1562,15 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             if (!c.getBlock().getType().isSolid() && !c.clone().add(0, 1, 0).getBlock().getType().isSolid()) { dest = c; break; }
         }
         if (dest == null) return;
-        p.getWorld().spawnParticle(Particle.PORTAL, base.add(0, 1, 0), 60, .4, .8, .4);
+        World w = p.getWorld();
+        Location from = base.clone().add(0, 1, 0), to = dest.clone().add(0, 1, 0);
+        beam(from, to, 0.3, l -> { dustAt(l, 150, 60, 255, 1.4f, 1, 0.12); sp(w, Particle.REVERSE_PORTAL, l, 2, .15, .15, .15, 0.05); });
+        helix(from, to, 0.7, 0.25, l -> sp(w, Particle.DRAGON_BREATH, l, 1));
+        sp(w, Particle.PORTAL, from, 70, .4, .8, .4, 0.8);
+        expandRing(base, 3, 6, l -> dustAt(l, 150, 60, 255, 1.5f, 1, 0.05));
         p.teleport(dest);
-        p.getWorld().spawnParticle(Particle.REVERSE_PORTAL, dest.clone().add(0, 1, 0), 60, .4, .8, .4);
+        sp(w, Particle.REVERSE_PORTAL, to, 70, .4, .8, .4, 0.4);
+        expandRing(dest, 3, 6, l -> dustAt(l, 190, 120, 255, 1.5f, 1, 0.05));
         p.getWorld().playSound(dest, Sound.ENTITY_ENDERMAN_TELEPORT, 1f, 0.8f);
     }
 
@@ -1185,35 +1578,50 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         Location eye = p.getEyeLocation();
         RayTraceResult r = p.getWorld().rayTraceEntities(eye, eye.getDirection(), 40, 0.6,
                 en -> en != p && en instanceof LivingEntity && !(en instanceof ArmorStand) && !en.isDead());
-        if (r == null || r.getHitEntity() == null) { p.sendActionBar(Component.text("No target in sight", NamedTextColor.GRAY)); return; }
+        if (r == null || r.getHitEntity() == null) { msg(p, Component.text("No target in sight", NamedTextColor.GRAY)); return; }
         if (!cd(p, "pull_of_the_void", 30)) return;
         Entity t = r.getHitEntity();
         Vector flat = eye.getDirection().setY(0);
         if (flat.lengthSquared() < 1e-4) flat = new Vector(0, 0, 1);
         Location dest = p.getLocation().add(flat.normalize().multiply(2));
         if (dest.getBlock().getType().isSolid() || dest.clone().add(0, 1, 0).getBlock().getType().isSolid()) dest = p.getLocation();
-        t.getWorld().spawnParticle(Particle.PORTAL, t.getLocation().add(0, 1, 0), 60, .4, .8, .4);
+        World w = t.getWorld();
+        Location from = t.getLocation().add(0, 1, 0), to = p.getLocation().add(0, 1, 0);
+        beam(from, to, 0.3, l -> { dustAt(l, 150, 60, 255, 1.4f, 1, 0.12); sp(w, Particle.PORTAL, l, 2, .15, .15, .15, 0.3); });
+        helix(from, to, 0.8, 0.25, l -> sp(w, Particle.REVERSE_PORTAL, l, 1));
+        sp(w, Particle.PORTAL, from, 70, .4, .8, .4, 0.8);
+        expandRing(t.getLocation(), 3, 6, l -> dustAt(l, 150, 60, 255, 1.5f, 1, 0.05));
         dest.setYaw(t.getLocation().getYaw()); dest.setPitch(t.getLocation().getPitch());
         t.teleport(dest);
+        sp(w, Particle.REVERSE_PORTAL, dest.clone().add(0, 1, 0), 60, .4, .8, .4, 0.4);
         t.getWorld().playSound(dest, Sound.ENTITY_ENDERMAN_TELEPORT, 1f, 0.6f);
     }
 
     // ---- Inferno
     void acidicBlaze(Player p) {
         LivingEntity t = lookTarget(p, 20);
-        if (t == null) { p.sendActionBar(Component.text("No target in sight", NamedTextColor.GRAY)); return; }
+        if (t == null) { msg(p, Component.text("No target in sight", NamedTextColor.GRAY)); return; }
         if (!cd(p, "acidic_blaze", 45)) return;
+        World w = t.getWorld();
+        beam(p.getEyeLocation().add(0, -0.3, 0), t.getLocation().add(0, 1, 0), 0.35, l -> { sp(w, Particle.FLAME, l, 2, .1, .1, .1, 0.02); dustAt(l, 140, 255, 40, 1.4f, 1, 0.1); });
+        sp(w, Particle.EXPLOSION, t.getLocation().add(0, 1, 0), 1);
+        expandRing(t.getLocation(), 3, 8, l -> { sp(w, Particle.FLAME, l, 2, .1, .3, .1, 0.04); dustAt(l, 140, 255, 40, 1.3f, 1, 0.05); });
         new BukkitRunnable() {
             int n = 0;
             @Override public void run() {
                 if (!t.isValid() || t.isDead() || n >= 100) { cancel(); return; }
                 t.setFireTicks(30);                                  // re-ignites every 2 ticks: water cannot put it out
+                Location b = t.getLocation().add(0, 1, 0);
+                sp(w, Particle.FLAME, b, 4, .3, .6, .3, 0.03);
+                dustAt(b, 140, 255, 40, 1.2f, 3, 0.4);
+                if (n % 4 == 0) sp(w, Particle.LAVA, b, 1, .3, .5, .3);
                 if (n % 10 == 0 && n > 0 && t.hasPotionEffect(PotionEffectType.FIRE_RESISTANCE))
                     trueDamage(t, p, 1.0);                           // bypasses fire resistance
                 n++;
             }
         }.runTaskTimer(this, 0, 2);
-        t.getWorld().playSound(t.getLocation(), Sound.ITEM_FIRECHARGE_USE, 1f, 0.7f);
+        w.playSound(t.getLocation(), Sound.ITEM_FIRECHARGE_USE, 1f, 0.7f);
+        w.playSound(t.getLocation(), Sound.BLOCK_FIRE_AMBIENT, 1f, 0.6f);
     }
 
     boolean inIncin(Location l) {
@@ -1225,38 +1633,54 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         return false;
     }
 
+    void evaporate(Location c, int R, World w) {
+        int cx = c.getBlockX(), cy = c.getBlockY(), cz = c.getBlockZ();
+        new BukkitRunnable() {
+            int x = -R, steam = 0;
+            @Override public void run() {
+                for (int n = 0; n < 5 && x <= R; n++, x++) {
+                    for (int dz = -R; dz <= R; dz++) for (int dy = -R; dy <= R; dy++) {
+                        if (x * x + dy * dy + dz * dz > R * R) continue;
+                        int bx = cx + x, by = cy + dy, bz = cz + dz;
+                        if (by < w.getMinHeight() || by >= w.getMaxHeight() || !w.isChunkLoaded(bx >> 4, bz >> 4)) continue;
+                        Block b = w.getBlockAt(bx, by, bz);
+                        Material t = b.getType();
+                        boolean gone = false;
+                        if (t == Material.WATER || t == Material.BUBBLE_COLUMN || t == Material.KELP || t == Material.KELP_PLANT
+                                || t == Material.SEAGRASS || t == Material.TALL_SEAGRASS) { b.setType(Material.AIR, false); gone = true; }
+                        else if (b.getBlockData() instanceof Waterlogged wl && wl.isWaterlogged()) { wl.setWaterlogged(false); b.setBlockData(wl, false); gone = true; }
+                        if (gone && (steam++ % 6 == 0)) sp(w, Particle.CLOUD, b.getLocation().add(0.5, 0.8, 0.5), 2, .3, .3, .3, 0.05);
+                    }
+                }
+                if (x > R) cancel();
+            }
+        }.runTaskTimer(this, 0, 1);
+    }
+
     void incinerate(Player p) {
         if (!cd(p, "incineration", 120)) return;
         int R = getConfig().getInt("incineration-radius", 20);
         Location c = p.getLocation().clone(); World w = c.getWorld();
         incin.put(p.getUniqueId(), new Incin(c, R, System.currentTimeMillis() + 20_000));
         w.playSound(c, Sound.ENTITY_BLAZE_SHOOT, 1.5f, 0.5f);
-        new BukkitRunnable() {
-            int x = -R;
-            @Override public void run() {
-                for (int n = 0; n < 4 && x <= R; n++, x++) {
-                    for (int dz = -R; dz <= R; dz++) for (int dy = -R; dy <= R; dy++) {
-                        if (x * x + dy * dy + dz * dz > R * R) continue;
-                        int bx = c.getBlockX() + x, by = c.getBlockY() + dy, bz = c.getBlockZ() + dz;
-                        if (by < w.getMinHeight() || by >= w.getMaxHeight() || !w.isChunkLoaded(bx >> 4, bz >> 4)) continue;
-                        Block b = w.getBlockAt(bx, by, bz);
-                        Material t = b.getType();
-                        if (t == Material.WATER || t == Material.KELP || t == Material.KELP_PLANT || t == Material.SEAGRASS
-                                || t == Material.TALL_SEAGRASS || t == Material.BUBBLE_COLUMN) b.setType(Material.AIR, false);
-                        else if (b.getBlockData() instanceof Waterlogged wl && wl.isWaterlogged()) {
-                            wl.setWaterlogged(false); b.setBlockData(wl, false);
-                        }
-                    }
-                }
-                if (x > R) cancel();
-            }
-        }.runTaskTimer(this, 0, 1);
-        // visual flames while active
-        new BukkitRunnable() {
+        w.playSound(c, Sound.ITEM_FIRECHARGE_USE, 1.5f, 0.5f);
+        w.playSound(c, Sound.ENTITY_GENERIC_EXPLODE, 1f, 0.5f);
+        expandRing(c, R, 20, l -> { sp(w, Particle.FLAME, l, 2, .1, .5, .1, 0.05); sp(w, Particle.LAVA, l, 1); });
+        expandRing(c, R * 0.6, 14, l -> sp(w, Particle.SMOKE, l.clone().add(0, 0.5, 0), 1, .1, .5, .1, 0.02));
+        column(c, 10, l -> sp(w, Particle.FLAME, l, 4, .6, .1, .6, 0.04));
+        evaporate(c, R, w);
+        for (int k = 1; k <= 5; k++) Bukkit.getScheduler().runTaskLater(this, () -> evaporate(c, R, w), k * 80L);   // re-scan in case water flows back
+        new BukkitRunnable() {          // inferno aura while it lasts
             int n = 0;
             @Override public void run() {
                 if (!p.isOnline() || n++ > 40) { cancel(); return; }
-                p.getWorld().spawnParticle(Particle.FLAME, p.getLocation().add(0, 1, 0), 40, 3, 1.5, 3, 0.02);
+                Location b = p.getLocation();
+                for (int i = 0; i < 6; i++) {
+                    double a = Math.random() * Math.PI * 2, r = 1 + Math.random() * 3;
+                    sp(w, Particle.FLAME, b.clone().add(Math.cos(a) * r, 0.1, Math.sin(a) * r), 0, 0, 1, 0, 0.25);
+                }
+                sp(w, Particle.FLAME, b.clone().add(0, 1, 0), 30, 3, 1.5, 3, 0.02);
+                sp(w, Particle.LAVA, b.clone().add(0, 1, 0), 3, 2, 1, 2);
             }
         }.runTaskTimer(this, 0, 10);
     }
@@ -1295,13 +1719,14 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
         if (id == null) return;
         final Player pf = p;
+        hitFx(victim, id);
         int n = hitCounters.merge(p.getUniqueId() + id, 1, Integer::sum);
         switch (id) {
             case "bloody_eclipse" -> {
                 Long end = bloodbath.get(p.getUniqueId());
                 if (end != null && end > System.currentTimeMillis()) {
                     e.setDamage(e.getDamage() * 1.5);
-                    victim.getWorld().spawnParticle(Particle.CRIT, victim.getLocation().add(0, 1, 0), 20, .3, .5, .3);
+                    sp(victim.getWorld(), Particle.CRIT, victim.getLocation().add(0, 1, 0), 20, .3, .5, .3);
                 }
                 if (n % 25 == 0) bleed(victim, p);
             }

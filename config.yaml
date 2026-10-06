@@ -42,3 +42,5 @@ temporal-dismemberment:
   mark-bonus: 0.25      # +25% damage from the holder against a Marked target
 # Primal Bow
 hunters-momentum-max: 30
+# Show ability cooldowns above the hotbar while holding a weapon
+cooldown-hud: true
