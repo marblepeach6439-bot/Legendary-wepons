@@ -8,6 +8,8 @@ import org.bukkit.*;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.block.Container;
+import org.bukkit.block.TileState;
+import org.bukkit.block.data.BlockData;
 import org.bukkit.block.data.Waterlogged;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
@@ -56,7 +58,8 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     final Map<UUID, Long> eclipsed = new HashMap<>();   // victims of Blinding Eclipse (no wind charges/cobwebs)
     final Map<UUID, Long> stunned = new HashMap<>();
     final Map<String, Integer> hitCounters = new HashMap<>();
-    final Map<Block, Material> domeFloor = new HashMap<>();   // breakable floor under the dome (block -> type we placed)
+    final Map<Block, BlockData> domeOrig = new HashMap<>();   // what each dome block replaced (restored afterwards)
+    final Map<UUID, String> packStatus = new HashMap<>();
     final Map<Block, Material> dome = new HashMap<>();  // dome block -> original material (always air)
     final Map<UUID, Incin> incin = new HashMap<>();
     final Map<Material, Material> smelt = new HashMap<>();
@@ -76,10 +79,10 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     @Override
     public void onEnable() {
         saveDefaultConfig();
-        KEY = new NamespacedKey(this, "weapon");
-        HUNT_KEY = new NamespacedKey(this, "hunt_arrow");
-        PRIMAL_KEY = new NamespacedKey(this, "primal_arrow");
-        CROSS_KEY = new NamespacedKey(this, "cocktail_arrow");
+        KEY = new NamespacedKey("dwarvenweapons", "weapon");
+        HUNT_KEY = new NamespacedKey("dwarvenweapons", "hunt_arrow");
+        PRIMAL_KEY = new NamespacedKey("dwarvenweapons", "primal_arrow");
+        CROSS_KEY = new NamespacedKey("dwarvenweapons", "cocktail_arrow");
         getServer().getPluginManager().registerEvents(this, this);
         buildSmeltMap();
         new BukkitRunnable() {
@@ -92,7 +95,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 Set<UUID> axeCarriers = new HashSet<>();
                 for (Player p : Bukkit.getOnlinePlayers()) {
                     String id = id(p.getInventory().getItemInMainHand());
-                    if (id != null) { if (t % 2 == 0) auraFx(p, id); hud(p, id); }
+                    if (id != null) { auraFx(p, id); hud(p, id); }
                     if ("kings_crown".equals(id(p.getInventory().getHelmet())) && t % 2 == 0) {
                         Location h = p.getEyeLocation().add(0, 0.55, 0);
                         sp(p.getWorld(), Particle.END_ROD, h, 1, 0.25, 0.05, 0.25, 0.01);
@@ -113,14 +116,9 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     @Override
     public void onDisable() {
-        for (Map.Entry<Block, Material> en : dome.entrySet()) {
-            Material t = en.getKey().getType();
-            if (t == Material.DIRT || t == Material.STONE) en.getKey().setType(en.getValue(), false);
-        }
+        for (Map.Entry<Block, BlockData> en : domeOrig.entrySet()) en.getKey().setBlockData(en.getValue(), false);
+        domeOrig.clear();
         dome.clear();
-        for (Map.Entry<Block, Material> en : domeFloor.entrySet())
-            if (en.getKey().getType() == en.getValue()) en.getKey().setType(Material.AIR, false);
-        domeFloor.clear();
     }
 
     void buildSmeltMap() {
@@ -128,7 +126,10 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         while (it.hasNext()) {
             Recipe r = it.next();
             if (r instanceof FurnaceRecipe fr && fr.getInputChoice() instanceof RecipeChoice.MaterialChoice mc) {
-                for (Material m : mc.getChoices()) smelt.putIfAbsent(m, fr.getResult().getType());
+                for (Material m : mc.getChoices()) {
+                    if (m == Material.NETHERRACK) continue;          // the pickaxe never smelts netherrack
+                    smelt.putIfAbsent(m, fr.getResult().getType());
+                }
             }
         }
     }
@@ -287,6 +288,13 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 else if (!give(t, a[2].toLowerCase())) s.sendMessage("Unknown weapon. Use /dweapons list");
                 else s.sendMessage("Given.");
             }
+            case "pack" -> { if (s instanceof Player pl) { sendPack(pl); s.sendMessage("Resource pack sent again."); } }
+            case "info" -> {
+                if (s instanceof Player pl) {
+                    s.sendMessage("Held weapon id: " + id(pl.getInventory().getItemInMainHand())
+                            + " | resource pack status: " + packStatus.getOrDefault(pl.getUniqueId(), "none yet"));
+                }
+            }
             default -> s.sendMessage("Unknown subcommand.");
         }
         return true;
@@ -295,7 +303,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     @Override
     public List<String> onTabComplete(CommandSender s, Command c, String l, String[] a) {
         List<String> out = new ArrayList<>();
-        if (a.length == 1) out.addAll(List.of("give", "list", "reload"));
+        if (a.length == 1) out.addAll(List.of("give", "list", "reload", "pack", "info"));
         else if (a.length == 2 && a[0].equalsIgnoreCase("give")) Bukkit.getOnlinePlayers().forEach(p -> out.add(p.getName()));
         else if (a.length == 3 && a[0].equalsIgnoreCase("give")) { out.addAll(IDS); out.add("all"); }
         out.removeIf(x -> !x.toLowerCase().startsWith(a[a.length - 1].toLowerCase()));
@@ -310,10 +318,24 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     }
 
     @EventHandler
-    public void onJoin(PlayerJoinEvent e) {
+    public void onJoin(PlayerJoinEvent e) { sendPack(e.getPlayer()); }
+
+    void sendPack(Player p) {
         String url = getConfig().getString("resource-pack-url", "");
-        if (url != null && !url.isBlank()) e.getPlayer().setResourcePack(url);
+        if (url == null || url.isBlank()) return;
+        String sha = getConfig().getString("resource-pack-sha1", "");
+        byte[] hash = null;
+        if (sha != null && sha.length() == 40) {
+            hash = new byte[20];
+            for (int i = 0; i < 20; i++) hash[i] = (byte) Integer.parseInt(sha.substring(i * 2, i * 2 + 2), 16);
+        }
+        UUID packId = UUID.nameUUIDFromBytes(("marbles-op-ah-weapons:" + sha).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        p.setResourcePack(packId, url, hash, Component.text("Marble's OP Ah Weapons textures", NamedTextColor.GOLD),
+                getConfig().getBoolean("resource-pack-required", false));
     }
+
+    @EventHandler
+    public void onPackStatus(PlayerResourcePackStatusEvent e) { packStatus.put(e.getPlayer().getUniqueId(), e.getStatus().name()); }
 
     // ------------------------------------------------------------------ helpers
     boolean cd(Player p, String key, int def) { return cd(p, key, def, false); }
@@ -994,6 +1016,58 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         Bukkit.getScheduler().runTaskLater(this, () -> setLunge(p, true), 100L);
     }
 
+    int[] swingColor(String id) {
+        return switch (id) {
+            case "bloody_eclipse" -> new int[]{220, 15, 30};
+            case "stormcaller" -> new int[]{120, 210, 255};
+            case "dwarven_pickaxe" -> new int[]{210, 210, 200};
+            case "ten_ton_axe" -> new int[]{200, 70, 60};
+            case "void_blade", "hammer_of_the_void" -> new int[]{160, 70, 255};
+            case "inferno" -> new int[]{255, 140, 30};
+            case "sculk_battle_axe" -> new int[]{30, 200, 230};
+            case "royal_spear", "divine_judgement" -> new int[]{255, 205, 60};
+            case "temporal_reaver" -> new int[]{50, 230, 100};
+            default -> new int[]{255, 255, 255};
+        };
+    }
+
+    Particle swingParticle(String id) {
+        return switch (id) {
+            case "stormcaller" -> Particle.ELECTRIC_SPARK;
+            case "void_blade" -> Particle.PORTAL;
+            case "hammer_of_the_void" -> Particle.REVERSE_PORTAL;
+            case "inferno" -> Particle.FLAME;
+            case "sculk_battle_axe" -> Particle.SCULK_SOUL;
+            case "royal_spear", "divine_judgement", "temporal_reaver" -> Particle.END_ROD;
+            case "dwarven_pickaxe" -> Particle.ENCHANTED_HIT;
+            default -> Particle.CRIT;
+        };
+    }
+
+    @EventHandler
+    public void onSwingTrail(PlayerAnimationEvent e) {
+        if (e.getAnimationType() != PlayerAnimationType.ARM_SWING) return;
+        Player p = e.getPlayer();
+        String id = id(p.getInventory().getItemInMainHand());
+        if (id == null || id.equals("kings_crown") || id.equals("primal_bow") || id.equals("mad_scientists_crossbow")) return;
+        int[] col = swingColor(id);
+        Particle part = swingParticle(id);
+        Location eye = p.getEyeLocation();
+        Vector dir = eye.getDirection().normalize();
+        Vector right = dir.clone().crossProduct(new Vector(0, 1, 0));
+        if (right.lengthSquared() < 1e-4) right = new Vector(1, 0, 0);
+        right.normalize();
+        Vector up = right.clone().crossProduct(dir).normalize();
+        World w = p.getWorld();
+        for (int i = 0; i <= 16; i++) {                       // glowing slash arc in front of the player
+            double ang = -1.0 + i * (2.0 / 16);
+            double lift = 0.35 - 0.7 * Math.abs(ang) / 1.0 * 0.5 + 0.2 * Math.sin(ang * 3);
+            Location l = eye.clone().add(dir.clone().multiply(Math.cos(ang) * 2.3)).add(right.clone().multiply(Math.sin(ang) * 2.3)).add(up.clone().multiply(lift - 0.3));
+            dustAt(l, col[0], col[1], col[2], 1.5f, 2, 0.03);
+            if (i % 2 == 0) sp(w, part, l, 1, 0.02, 0.02, 0.02, 0.02);
+        }
+    }
+
     @EventHandler
     public void onJoinLunge(PlayerJoinEvent e) { setLunge(e.getPlayer(), true); }
 
@@ -1358,55 +1432,78 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     }
 
     // ---- Dwarven Pickaxe
+    boolean domeReplaceable(Block b) {
+        Material t = b.getType();
+        if (dome.containsKey(b)) return false;
+        switch (t) {
+            case BEDROCK, BARRIER, END_PORTAL_FRAME, END_PORTAL, NETHER_PORTAL, END_GATEWAY, COMMAND_BLOCK, CHAIN_COMMAND_BLOCK,
+                 REPEATING_COMMAND_BLOCK, STRUCTURE_BLOCK, JIGSAW, SPAWNER, REINFORCED_DEEPSLATE -> { return false; }
+            default -> { }
+        }
+        return t.isAir() || !(b.getState(false) instanceof TileState);   // chests, signs, etc. keep their contents
+    }
+
+    void restoreDome(List<Block> order) {
+        new BukkitRunnable() {
+            int i = order.size() - 1;
+            @Override public void run() {
+                for (int n = 0; n < 400 && i >= 0; n++, i--) {
+                    Block b = order.get(i);
+                    if (dome.remove(b) == null) continue;
+                    BlockData od = domeOrig.remove(b);
+                    if (od != null) b.setBlockData(od, false);
+                }
+                if (i < 0) cancel();
+            }
+        }.runTaskTimer(this, 0, 1);
+    }
+
     void callOfTheDeep(Player p) {
         if (!cd(p, "call_of_the_deep", 120)) return;
         int R = getConfig().getInt("dome-radius", 20);
         Location c = p.getLocation(); World w = c.getWorld(); Random rnd = new Random();
-        List<Block> placed = new ArrayList<>();
+        List<Block> shell = new ArrayList<>(), floor = new ArrayList<>();
         for (int x = -R - 1; x <= R + 1; x++) for (int y = -R - 1; y <= R + 1; y++) for (int z = -R - 1; z <= R + 1; z++) {
             double d = Math.sqrt(x * x + y * y + z * z);
             if (d < R - 0.5 || d >= R + 0.5) continue;
-            int by = c.getBlockY() + y;
-            if (by < w.getMinHeight() || by >= w.getMaxHeight()) continue;
-            int bx = c.getBlockX() + x, bz = c.getBlockZ() + z;
-            if (!w.isChunkLoaded(bx >> 4, bz >> 4)) continue;
+            int by = c.getBlockY() + y, bx = c.getBlockX() + x, bz = c.getBlockZ() + z;
+            if (by < w.getMinHeight() || by >= w.getMaxHeight() || !w.isChunkLoaded(bx >> 4, bz >> 4)) continue;
             Block b = w.getBlockAt(bx, by, bz);
-            if (!b.getType().isAir()) continue;       // never overwrite existing blocks
-            b.setType(rnd.nextBoolean() ? Material.DIRT : Material.STONE, false);
-            dome.put(b, Material.AIR); placed.add(b);
+            if (domeReplaceable(b)) shell.add(b);          // terrain, water, anything: it all becomes dome
         }
-        // floor (3 layers, only over air) under the dome - unbreakable, same as the walls
-        for (int dx = -R; dx <= R; dx++) for (int dz = -R; dz <= R; dz++) {
+        for (int dx = -R; dx <= R; dx++) for (int dz = -R; dz <= R; dz++) {   // 3-layer floor under the holder, over air only
             if (dx * dx + dz * dz > R * R) continue;
             for (int layer = 1; layer <= 3; layer++) {
-                int by = c.getBlockY() - layer;
-                if (by < w.getMinHeight()) break;
-                int bx = c.getBlockX() + dx, bz = c.getBlockZ() + dz;
-                if (!w.isChunkLoaded(bx >> 4, bz >> 4)) break;
+                int by = c.getBlockY() - layer, bx = c.getBlockX() + dx, bz = c.getBlockZ() + dz;
+                if (by < w.getMinHeight() || !w.isChunkLoaded(bx >> 4, bz >> 4)) break;
                 Block fb = w.getBlockAt(bx, by, bz);
-                if (!fb.getType().isAir()) continue;
-                Material fm = rnd.nextBoolean() ? Material.DIRT : Material.STONE;
-                fb.setType(fm, false);
-                dome.put(fb, Material.AIR); placed.add(fb);        // unbreakable like the dome walls; removed with the dome
+                if (fb.getType().isAir() && !dome.containsKey(fb)) floor.add(fb);
             }
         }
+        shell.sort(Comparator.comparingInt(Block::getY));      // the dome grows from the bottom up
+        List<Block> order = new ArrayList<>(floor);
+        order.addAll(shell);
         w.playSound(c, Sound.BLOCK_ANVIL_LAND, 1f, 0.5f);
         w.playSound(c, Sound.ENTITY_GENERIC_EXPLODE, 1f, 0.5f);
-        for (int i = 0; i < placed.size(); i += 3)
-            sp(w, Particle.BLOCK, placed.get(i).getLocation().add(0.5, 0.5, 0.5), 6, .4, .4, .4, 0, (i % 2 == 0 ? Material.DIRT : Material.STONE).createBlockData());
         expandRing(c, R, 16, l -> { sp(w, Particle.CLOUD, l, 2, .3, .2, .3, 0.02); sp(w, Particle.BLOCK, l, 3, .3, .2, .3, 0, Material.STONE.createBlockData()); });
         column(c, 6, l -> sp(w, Particle.CLOUD, l, 2, .5, .1, .5, 0.02));
         msg(p, Component.text("CALL OF THE DEEP", NamedTextColor.GRAY));
-        Bukkit.getScheduler().runTaskLater(this, () -> {
-            for (Block b : placed) {
-                Material t = b.getType();
-                if (dome.remove(b) != null && (t == Material.DIRT || t == Material.STONE)) b.setType(Material.AIR, false);
+        new BukkitRunnable() {
+            int i = 0;
+            @Override public void run() {
+                for (int n = 0; n < 220 && i < order.size(); n++, i++) {
+                    Block b = order.get(i);
+                    domeOrig.put(b, b.getBlockData());
+                    Material m = rnd.nextBoolean() ? Material.DIRT : Material.STONE;
+                    b.setType(m, false);
+                    dome.put(b, Material.AIR);
+                    if (i % 9 == 0) sp(w, Particle.BLOCK, b.getLocation().add(0.5, 0.5, 0.5), 6, .3, .3, .3, 0, m.createBlockData());
+                    if (i % 70 == 0) w.playSound(b.getLocation(), Sound.BLOCK_STONE_PLACE, 1f, 0.6f);
+                }
+                if (i >= order.size()) cancel();
             }
-            for (Block b : new ArrayList<>(domeFloor.keySet())) {
-                Material placedType = domeFloor.remove(b);
-                if (b.getType() == placedType) b.setType(Material.AIR, false);     // only if nobody replaced it
-            }
-        }, 1200L);
+        }.runTaskTimer(this, 0, 1);
+        Bukkit.getScheduler().runTaskLater(this, () -> restoreDome(order), 1200L);
     }
 
     boolean isOre(Material m) { return m == Material.ANCIENT_DEBRIS || m.name().endsWith("_ORE"); }
@@ -1725,8 +1822,19 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "bloody_eclipse" -> {
                 Long end = bloodbath.get(p.getUniqueId());
                 if (end != null && end > System.currentTimeMillis()) {
-                    e.setDamage(e.getDamage() * 1.5);
-                    sp(victim.getWorld(), Particle.CRIT, victim.getLocation().add(0, 1, 0), 20, .3, .5, .3);
+                    boolean vanillaCrit = p.getFallDistance() > 0 && !p.isOnGround() && !p.isInWater() && !p.isClimbing()
+                            && !p.isInsideVehicle() && !p.isSprinting() && !p.hasPotionEffect(PotionEffectType.BLINDNESS);
+                    if (!vanillaCrit) e.setDamage(e.getDamage() * 1.5);       // vanilla crit multiplier (a real falling crit already has it)
+                    World cw = victim.getWorld(); Location cl = victim.getLocation().add(0, victim.getHeight() * 0.6, 0);
+                    cw.playSound(cl, Sound.ENTITY_PLAYER_ATTACK_CRIT, 1f, 0.9f);
+                    sp(cw, Particle.CRIT, cl, 30, .35, .45, .35, 0.5);
+                    sp(cw, Particle.DAMAGE_INDICATOR, cl, 6, .3, .4, .3, 0.1);
+                    dustAt(cl, 200, 10, 20, 1.6f, 14, 0.45);
+                    Vector side = p.getLocation().getDirection().clone().crossProduct(new Vector(0, 1, 0));
+                    if (side.lengthSquared() < 1e-4) side = new Vector(1, 0, 0);
+                    side.normalize();
+                    beam(cl.clone().add(side.clone().multiply(0.9)).add(0, 0.7, 0), cl.clone().add(side.clone().multiply(-0.9)).add(0, -0.7, 0),
+                            0.15, l -> dustAt(l, 255, 40, 50, 1.3f, 1, 0.01));
                 }
                 if (n % 25 == 0) bleed(victim, p);
             }

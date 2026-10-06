@@ -1,0 +1,15 @@
+name: MarblesOpAhWeapons
+prefix: "Marble's OP Ah Weapons"
+version: 1.0.0
+main: dev.dwarven.DwarvenWeapons
+api-version: '1.21'
+description: Marble's OP Ah Weapons - custom weapons with abilities and passives
+commands:
+  dweapons:
+    description: Marble's OP Ah Weapons - custom weapons with abilities and passives
+    usage: /dweapons <give|list|reload|pack|info> [player] [weapon]
+    aliases: [weapons, dw, mow]
+    permission: dwarven.admin
+permissions:
+  dwarven.admin:
+    default: op

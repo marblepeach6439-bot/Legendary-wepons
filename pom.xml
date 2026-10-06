@@ -5,6 +5,7 @@
   <groupId>dev.dwarven</groupId>
   <artifactId>DwarvenWeapons</artifactId>
   <version>1.0.0</version>
+  <name>Marble's OP Ah Weapons</name>
   <packaging>jar</packaging>
   <properties>
     <maven.compiler.source>21</maven.compiler.source>
