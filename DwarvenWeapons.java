@@ -68,6 +68,9 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     final Map<UUID, Long> lungeCd = new HashMap<>();
     final Map<UUID, String> lastMaceId = new HashMap<>();     // for attribute swapping: the mace held a moment ago
     final Map<UUID, Long> lastMaceTime = new HashMap<>();
+    final Map<Block, BlockData> incinOrig = new HashMap<>();
+    final Map<Block, Material> incinSet = new HashMap<>();
+    final Map<UUID, Integer> bleedHits = new HashMap<>();
     final Map<UUID, Integer> airHits = new HashMap<>();   // mace hits since last touching the ground
     final Map<UUID, Thrown> thrown = new HashMap<>();
     final Map<UUID, Long> holdUntil = new HashMap<>();   // action-bar message hold (HUD pauses)
@@ -126,6 +129,11 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         for (Map.Entry<Block, BlockData> en : domeOrig.entrySet()) en.getKey().setBlockData(en.getValue(), false);
         domeOrig.clear();
         dome.clear();
+        for (Map.Entry<Block, BlockData> en : incinOrig.entrySet()) {
+            Material st = incinSet.get(en.getKey());
+            if (st != null && en.getKey().getType() == st) en.getKey().setBlockData(en.getValue(), false);
+        }
+        incinOrig.clear(); incinSet.clear();
     }
 
     void buildSmeltMap() {
@@ -157,13 +165,13 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.FIRE_ASPECT, 3);
                 en.put(Enchantment.MENDING, 1); en.put(Enchantment.UNBREAKING, 3);
                 lore = List.of("Ability 1 [F]: Bloodbath - every hit crits for 10s",
-                        "Ability 2 [Shift+F]: Blinding Eclipse - blind enemies, no wind charges/cobwebs 10s",
-                        "Passive: Bleed every 25 hits, Speed II, Strength I");
+                        "Ability 2 [Shift+F]: Blinding Eclipse - blind enemies, no wind charges/cobwebs 20s",
+                        "Passive: Bleed every 5 hits (10s cooldown), Speed II, Strength I");
             }
             case "stormcaller" -> {
                 mat = Material.TRIDENT; name = "Stormcaller"; col = TextColor.color(0x5AC8FF);
                 en.put(Enchantment.RIPTIDE, 3); en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
-                lore = List.of("Ability 1 [F]: Lightning Storm - 3 strikes, 2 hearts true damage each",
+                lore = List.of("Ability 1 [F]: Lightning Storm - 3 strikes, 1 heart true damage each",
                         "Ability 2 [Shift+F]: Tides Call - pull & drown everything within 20 blocks",
                         "Passive: lightning every 5 hits, Water Breathing, Dolphin's Grace, Conduit Power");
             }
@@ -194,12 +202,12 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.FIRE_ASPECT, 2);
                 en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
                 lore = List.of("Ability 1 [F]: Acidic Blaze - unquenchable fire that ignores fire resistance, 10s",
-                        "Ability 2 [Shift+F]: Incineration - evaporates water, enemies take 2x damage, 20s");
+                        "Ability 2 [Shift+F]: Incineration - turns the area into the Nether, enemies take 1.25x damage, 20s");
             }
             case "sculk_battle_axe" -> {
                 mat = Material.NETHERITE_AXE; name = "Sculk Battle Axe"; col = TextColor.color(0x28C8DC);
                 en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
-                lore = List.of("Ability 1 [F]: Sculk Beams - 3 warden beams, 2 hearts true damage + heavy armor durability each",
+                lore = List.of("Ability 1 [F]: Sculk Beams - 3 warden beams, 1 heart true damage + heavy armor durability each",
                         "Ability 2 [Shift+F]: Summon a Warden",
                         "Passive: Wardens are not hostile to you, Strength I, Speed II, Resistance I");
             }
@@ -224,7 +232,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 en.put(Enchantment.DENSITY, 2); en.put(Enchantment.WIND_BURST, 1);
                 en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
                 lore = List.of("Ability 1 [F]: Smite - throw the mace, pull the enemy to you, 3 hearts true damage",
-                        "Ability 2: Final Verdict - 5th mace hit without touching the ground explodes: 2x damage, 60 durability to every armor piece",
+                        "Ability 2: Final Verdict - 3rd mace hit without touching the ground explodes: 2x damage, 60 durability to every armor piece",
                         "Passive: Shift+Right-click cycles Wind Burst I / II / III");
             }
             case "hammer_of_the_void" -> {
@@ -232,7 +240,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 en.put(Enchantment.DENSITY, 2); en.put(Enchantment.WIND_BURST, 1);
                 en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
                 lore = List.of("Ability 1 [F]: throw the mace, then Right-click to teleport to it",
-                        "Ability 2: Void Strike - the hit after 5 mace hits without touching the ground: 2x damage, Wither II + Poison II 20s",
+                        "Ability 2: Void Strike - the hit after 3 mace hits without touching the ground: 2x damage, Wither II + Poison II 20s",
                         "Passive: Shift+Right-click cycles Wind Burst I / II / III");
             }
             case "temporal_reaver" -> {
@@ -251,9 +259,9 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             }
             case "mad_scientists_crossbow" -> {
                 mat = Material.CROSSBOW; name = "Mad Scientist's Crossbow"; col = TextColor.color(0x78FF1E);
-                en.put(Enchantment.QUICK_CHARGE, 5); en.put(Enchantment.MULTISHOT, 1);
+                en.put(Enchantment.QUICK_CHARGE, 5); en.put(Enchantment.MULTISHOT, 1); en.put(Enchantment.INFINITY, 1);
                 en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
-                lore = List.of("Passive: Furious Cocktail - every arrow carries a random potion effect",
+                lore = List.of("Passive: Furious Cocktail - every arrow carries a random potion effect (never instant damage/health)",
                         "Passive: Grapple - every hit pulls the enemy 5 blocks toward you");
             }
             default -> { return null; }
@@ -451,7 +459,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 w.playSound(p.getLocation(), Sound.ENTITY_WARDEN_SONIC_BOOM, 1f, 1f);
                 sp(w, Particle.SCULK_SOUL, to, 25, .4, .6, .4, 0.08);
                 expandRing(t.getLocation(), 3, 6, l -> dustAt(l, 30, 200, 230, 1.5f, 1, 0.05));
-                trueDamage(t, p, 4.0);
+                trueDamage(t, p, 2.0);
                 drainArmor(t, drain);
             }, i * 6L);
         }
@@ -553,8 +561,8 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         if (p.isOnGround()) { airHits.remove(u); return; }
         int c = airHits.getOrDefault(u, 0) + 1;
         if (id.equals("divine_judgement")) {
-            if (c >= 5) {
-                if (!cd(p, "final_verdict", 30, true)) { airHits.put(u, 5); return; }   // wait for cooldown, keep the charge
+            if (c >= 3) {
+                if (!cd(p, "final_verdict", 30, true)) { airHits.put(u, 3); return; }   // wait for cooldown, keep the charge
                 Location l = v.getLocation();
                 e.setDamage(e.getDamage() * 2);
                 World fw = l.getWorld();
@@ -572,7 +580,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 airHits.remove(u);
                 return;
             }
-        } else if (c >= 6) {   // 5 hits, then the NEXT hit is the void strike
+        } else if (c >= 4) {   // 3 hits, then the NEXT hit is the void strike
             e.setDamage(e.getDamage() * 2);
             v.addPotionEffect(new PotionEffect(PotionEffectType.WITHER, 400, 1));
             v.addPotionEffect(new PotionEffect(PotionEffectType.POISON, 400, 1));
@@ -926,12 +934,6 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 if (hunt) sp(aw, Particle.END_ROD, l, 1, .05, .05, .05, 0.01);
             });
         }
-        int max = getConfig().getInt("hunters-momentum-max", 30);
-        int m = Math.min(max, momentum.getOrDefault(p.getUniqueId(), 0) + 1);
-        momentum.put(p.getUniqueId(), m);
-        msg(p, Component.text("Hunter's Momentum +" + m, NamedTextColor.AQUA));
-        dustAt(p.getEyeLocation(), 80, 225, 225, 1.2f, 6 + m / 2, 0.5);
-        sp(p.getWorld(), Particle.HAPPY_VILLAGER, p.getLocation().add(0, 1, 0), 3 + m / 4, .5, .6, .5);
     }
 
     @EventHandler(ignoreCancelled = true)
@@ -947,9 +949,9 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         if (!"mad_scientists_crossbow".equals(id(p.getInventory().getItemInMainHand()))
                 && !"mad_scientists_crossbow".equals(id(p.getInventory().getItemInOffHand()))) return;
         PotionEffectType[] pool = {PotionEffectType.POISON, PotionEffectType.SLOWNESS, PotionEffectType.WEAKNESS, PotionEffectType.WITHER,
-                PotionEffectType.BLINDNESS, PotionEffectType.INSTANT_DAMAGE, PotionEffectType.HUNGER, PotionEffectType.NAUSEA,
+                PotionEffectType.BLINDNESS, PotionEffectType.HUNGER, PotionEffectType.NAUSEA,
                 PotionEffectType.LEVITATION, PotionEffectType.GLOWING, PotionEffectType.SPEED, PotionEffectType.STRENGTH,
-                PotionEffectType.REGENERATION, PotionEffectType.INSTANT_HEALTH, PotionEffectType.RESISTANCE, PotionEffectType.JUMP_BOOST};
+                PotionEffectType.REGENERATION, PotionEffectType.RESISTANCE, PotionEffectType.JUMP_BOOST};
         PotionEffectType t = pool[new Random().nextInt(pool.length)];
         a.addCustomEffect(new PotionEffect(t, 200, 1), true);
         a.setColor(t.getColor());
@@ -998,9 +1000,14 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         if (pdc.has(PRIMAL_KEY, PersistentDataType.BYTE)) {
             int m = momentum.getOrDefault(p.getUniqueId(), 0);
             if (m > 0) e.setDamage(e.getDamage() + m);          // +1 damage per stack
+            int nm = Math.min(getConfig().getInt("hunters-momentum-max", 30), m + 1);   // only a successful hit builds momentum
+            momentum.put(p.getUniqueId(), nm);
+            msg(p, Component.text("Hunter's Momentum +" + nm, NamedTextColor.AQUA));
+            dustAt(p.getEyeLocation(), 80, 225, 225, 1.2f, 6 + nm / 2, 0.5);
+            sp(p.getWorld(), Particle.HAPPY_VILLAGER, p.getLocation().add(0, 1, 0), 3 + nm / 4, .5, .6, .5);
         }
         if (pdc.has(CROSS_KEY, PersistentDataType.BYTE))
-            Bukkit.getScheduler().runTask(this, () -> grapplePull(v, p, 5.0));
+            { if (cd(p, "grapple", 5, true)) Bukkit.getScheduler().runTask(this, () -> grapplePull(v, p, 5.0)); }
     }
 
     // ---- Royal Spear
@@ -1287,7 +1294,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     String[][] abilitiesOf(String id) {
         return switch (id) {
-            case "bloody_eclipse" -> new String[][]{{"F Bloodbath", "bloodbath"}, {"Shift+F Eclipse", "blinding_eclipse"}};
+            case "bloody_eclipse" -> new String[][]{{"F Bloodbath", "bloodbath"}, {"Shift+F Eclipse", "blinding_eclipse"}, {"Bleed", "bleed"}};
             case "stormcaller" -> new String[][]{{"F Storm", "lightning_storm"}, {"Shift+F Tides", "tides_call"}};
             case "dwarven_pickaxe" -> new String[][]{{"F Call of the Deep", "call_of_the_deep"}};
             case "ten_ton_axe" -> new String[][]{{"F Stun", "stunning_strike"}, {"Shift+F Drain", "durability_drain"}};
@@ -1299,6 +1306,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "hammer_of_the_void" -> new String[][]{{"F Throw", "void_throw"}};
             case "temporal_reaver" -> new String[][]{{"F Cleave", "temporal_cleave"}, {"Shift+F Dismember", "temporal_dismemberment"}};
             case "primal_bow" -> new String[][]{{"F Hunt", "live_for_the_hunt"}};
+            case "mad_scientists_crossbow" -> new String[][]{{"Grapple", "grapple"}};
             default -> new String[0][];
         };
     }
@@ -1428,12 +1436,12 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     void blindingEclipse(Player p) {
         if (!cd(p, "blinding_eclipse", 60)) return;
-        long end = System.currentTimeMillis() + 10_000;
+        long end = System.currentTimeMillis() + 20_000;
         World w = p.getWorld(); Location c = p.getLocation();
         for (Entity en : p.getNearbyEntities(20, 20, 20)) {
             if (!(en instanceof LivingEntity le) || en instanceof ArmorStand) continue;
             if (en.getLocation().distanceSquared(c) > 400) continue;
-            le.addPotionEffect(new PotionEffect(PotionEffectType.BLINDNESS, 200, 0));
+            le.addPotionEffect(new PotionEffect(PotionEffectType.BLINDNESS, 400, 0));
             sp(w, Particle.SQUID_INK, le.getEyeLocation(), 16, .3, .3, .3, 0.05);
             if (en instanceof Player v) eclipsed.put(v.getUniqueId(), end);
         }
@@ -1515,7 +1523,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 sp(w, Particle.ELECTRIC_SPARK, g.clone().add(0, 1, 0), 70, .6, .9, .6, 0.7);
                 sp(w, Particle.SPLASH, g.clone().add(0, 0.3, 0), 30, .6, .1, .6, 0.2);
                 expandRing(g, 4, 6, l -> sp(w, Particle.ELECTRIC_SPARK, l, 1));
-                trueDamage(t, p, 4.0);
+                trueDamage(t, p, 2.0);
             }, 20L + i * 6L);
         }
     }
@@ -1777,7 +1785,16 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     }
 
     @EventHandler
-    public void onStunInteract(PlayerInteractEvent e) { if (isStunned(e.getPlayer())) e.setCancelled(true); }
+    public void onStunInteract(PlayerInteractEvent e) {
+        if (!isStunned(e.getPlayer())) return;
+        ItemStack it = e.getItem();
+        if (it != null) {
+            Material m = it.getType();       // golden apples and potions still work while frozen or stunned
+            if (m == Material.GOLDEN_APPLE || m == Material.ENCHANTED_GOLDEN_APPLE || m == Material.POTION
+                    || m == Material.SPLASH_POTION || m == Material.LINGERING_POTION) return;
+        }
+        e.setCancelled(true);
+    }
 
     // ---- Void Blade
     void voidWalk(Player p) {
@@ -1862,26 +1879,79 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         return false;
     }
 
-    void evaporate(Location c, int R, World w) {
+    Material netherOf(Material m, Random rnd) {
+        String n = m.name();
+        if (n.contains("NETHER") || n.contains("CRIMSON") || n.contains("WARPED") || n.contains("BLACKSTONE") || n.contains("BASALT")
+                || n.equals("MAGMA_BLOCK") || n.equals("SOUL_SAND") || n.equals("SOUL_SOIL") || n.equals("GLOWSTONE")) return null;
+        switch (m) {
+            case WATER, BUBBLE_COLUMN, KELP, KELP_PLANT, SEAGRASS, TALL_SEAGRASS, SHORT_GRASS, TALL_GRASS, FERN, LARGE_FERN,
+                 DEAD_BUSH, SNOW, VINE, SUGAR_CANE -> { return Material.AIR; }
+            case GRASS_BLOCK, PODZOL, MYCELIUM -> { return rnd.nextInt(4) == 0 ? Material.WARPED_NYLIUM : Material.CRIMSON_NYLIUM; }
+            case DIRT, COARSE_DIRT, ROOTED_DIRT, FARMLAND, DIRT_PATH, MUD, CLAY, MOSS_BLOCK, SNOW_BLOCK -> { return Material.NETHERRACK; }
+            case SAND, RED_SAND, SUSPICIOUS_SAND -> { return Material.SOUL_SAND; }
+            case GRAVEL, SUSPICIOUS_GRAVEL -> { return Material.SOUL_SOIL; }
+            case ICE, PACKED_ICE, BLUE_ICE, FROSTED_ICE -> { return Material.MAGMA_BLOCK; }
+            case DEEPSLATE, COBBLED_DEEPSLATE, TUFF, CALCITE -> { return Material.BLACKSTONE; }
+            case STONE, COBBLESTONE, MOSSY_COBBLESTONE, ANDESITE, DIORITE, GRANITE, SANDSTONE, RED_SANDSTONE, SMOOTH_SANDSTONE,
+                 DRIPSTONE_BLOCK, STONE_BRICKS, MOSSY_STONE_BRICKS -> {
+                int r = rnd.nextInt(100);
+                return r < 6 ? Material.MAGMA_BLOCK : (r < 8 ? Material.GLOWSTONE : Material.NETHERRACK);
+            }
+            default -> { }
+        }
+        if (n.endsWith("_ORE")) return Material.NETHER_QUARTZ_ORE;
+        if (n.endsWith("_LOG") || n.endsWith("_WOOD")) return rnd.nextBoolean() ? Material.CRIMSON_STEM : Material.WARPED_STEM;
+        if (n.endsWith("_PLANKS")) return Material.CRIMSON_PLANKS;
+        if (n.endsWith("_LEAVES")) return rnd.nextBoolean() ? Material.NETHER_WART_BLOCK : Material.WARPED_WART_BLOCK;
+        return null;
+    }
+
+    void netherize(Location c, int R, World w, List<Block> changed) {
         int cx = c.getBlockX(), cy = c.getBlockY(), cz = c.getBlockZ();
         new BukkitRunnable() {
-            int x = -R, steam = 0;
+            int x = -R, sample = 0;
+            final Random rnd = new Random();
             @Override public void run() {
-                for (int n = 0; n < 5 && x <= R; n++, x++) {
+                for (int n = 0; n < 4 && x <= R; n++, x++) {
                     for (int dz = -R; dz <= R; dz++) for (int dy = -R; dy <= R; dy++) {
                         if (x * x + dy * dy + dz * dz > R * R) continue;
                         int bx = cx + x, by = cy + dy, bz = cz + dz;
                         if (by < w.getMinHeight() || by >= w.getMaxHeight() || !w.isChunkLoaded(bx >> 4, bz >> 4)) continue;
                         Block b = w.getBlockAt(bx, by, bz);
                         Material t = b.getType();
-                        boolean gone = false;
-                        if (t == Material.WATER || t == Material.BUBBLE_COLUMN || t == Material.KELP || t == Material.KELP_PLANT
-                                || t == Material.SEAGRASS || t == Material.TALL_SEAGRASS) { b.setType(Material.AIR, false); gone = true; }
-                        else if (b.getBlockData() instanceof Waterlogged wl && wl.isWaterlogged()) { wl.setWaterlogged(false); b.setBlockData(wl, false); gone = true; }
-                        if (gone && (steam++ % 6 == 0)) sp(w, Particle.CLOUD, b.getLocation().add(0.5, 0.8, 0.5), 2, .3, .3, .3, 0.05);
+                        if (t.isAir() || dome.containsKey(b) || incinOrig.containsKey(b)) continue;
+                        if (t != Material.WATER && b.getBlockData() instanceof Waterlogged wl && wl.isWaterlogged()) {
+                            incinOrig.put(b, b.getBlockData()); incinSet.put(b, t); changed.add(b);
+                            wl.setWaterlogged(false); b.setBlockData(wl, false);
+                            continue;
+                        }
+                        Material to = netherOf(t, rnd);
+                        if (to == null) continue;
+                        incinOrig.put(b, b.getBlockData()); incinSet.put(b, to); changed.add(b);
+                        b.setType(to, false);
+                        if (sample++ % 7 == 0) {
+                            sp(w, Particle.FLAME, b.getLocation().add(0.5, 1, 0.5), 2, .3, .2, .3, 0.02);
+                            if (sample % 21 == 0) sp(w, Particle.ASH, b.getLocation().add(0.5, 1, 0.5), 6, .5, .5, .5, 0);
+                        }
                     }
                 }
                 if (x > R) cancel();
+            }
+        }.runTaskTimer(this, 0, 1);
+    }
+
+    void revertNether(List<Block> changed) {
+        new BukkitRunnable() {
+            int i = changed.size() - 1;
+            @Override public void run() {
+                for (int n = 0; n < 500 && i >= 0; n++, i--) {
+                    Block b = changed.get(i);
+                    BlockData od = incinOrig.remove(b);
+                    Material st = incinSet.remove(b);
+                    if (od == null || st == null) continue;
+                    if (b.getType() == st) b.setBlockData(od, false);       // only if nobody changed it meanwhile
+                }
+                if (i < 0) cancel();
             }
         }.runTaskTimer(this, 0, 1);
     }
@@ -1897,8 +1967,13 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         expandRing(c, R, 20, l -> { sp(w, Particle.FLAME, l, 2, .1, .5, .1, 0.05); sp(w, Particle.LAVA, l, 1); });
         expandRing(c, R * 0.6, 14, l -> sp(w, Particle.SMOKE, l.clone().add(0, 0.5, 0), 1, .1, .5, .1, 0.02));
         column(c, 10, l -> sp(w, Particle.FLAME, l, 4, .6, .1, .6, 0.04));
-        evaporate(c, R, w);
-        for (int k = 1; k <= 5; k++) Bukkit.getScheduler().runTaskLater(this, () -> evaporate(c, R, w), k * 80L);   // re-scan in case water flows back
+        List<Block> changed = new ArrayList<>();
+        netherize(c, R, w, changed);              // the whole area turns into Nether blocks...
+        Bukkit.getScheduler().runTaskLater(this, () -> {      // ...and changes back when the 20 seconds are over
+            w.playSound(c, Sound.BLOCK_FIRE_EXTINGUISH, 1.5f, 0.7f);
+            expandRing(c, R, 16, l -> sp(w, Particle.CLOUD, l, 2, .3, .3, .3, 0.03));
+            revertNether(changed);
+        }, 400L);
         new BukkitRunnable() {          // inferno aura while it lasts
             int n = 0;
             @Override public void run() {
@@ -1916,7 +1991,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     @EventHandler(ignoreCancelled = true)
     public void onWaterFlow(BlockFromToEvent e) {
-        if (e.getBlock().getType() == Material.WATER && inIncin(e.getBlock().getLocation())) e.setCancelled(true);
+        if (e.getBlock().getType() == Material.WATER && (inIncin(e.getBlock().getLocation()) || inIncin(e.getToBlock().getLocation()))) e.setCancelled(true);
     }
 
     @EventHandler(ignoreCancelled = true)
@@ -1935,12 +2010,12 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
         if (isStunned(p)) { e.setCancelled(true); return; }
 
-        // Inferno - Incineration: players in the area take 2x damage from the wielder
+        // Inferno - Incineration: players in the area take 1.25x damage from the wielder
         Incin in = incin.get(p.getUniqueId());
         if (in != null && in.end() > System.currentTimeMillis() && victim instanceof Player
                 && p.getWorld().equals(victim.getWorld())
                 && victim.getLocation().distanceSquared(in.center()) <= (double) in.radius() * in.radius())
-            e.setDamage(e.getDamage() * 2);
+            e.setDamage(e.getDamage() * 1.25);
 
         Mark mk = marks.get(victim.getUniqueId());
         if (mk != null && mk.holder().equals(p.getUniqueId()) && mk.end() > System.currentTimeMillis())
@@ -1972,7 +2047,8 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                     beam(cl.clone().add(side.clone().multiply(0.9)).add(0, 0.7, 0), cl.clone().add(side.clone().multiply(-0.9)).add(0, -0.7, 0),
                             0.15, l -> dustAt(l, 255, 40, 50, 1.3f, 1, 0.01));
                 }
-                if (n % 25 == 0) bleed(victim, p);
+                int bc = bleedHits.merge(p.getUniqueId(), 1, Integer::sum);          // every 5 hits, then a 10 second cooldown
+                if (bc >= 5 && cd(p, "bleed", 10, true)) { bleed(victim, p); bleedHits.remove(p.getUniqueId()); }
             }
             case "divine_judgement", "hammer_of_the_void" -> { recordMace(p, id); maceHit(e, p, victim, id); }
             case "stormcaller" -> {
@@ -1983,7 +2059,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 if (qualifies && hitCounters.merge(p.getUniqueId() + "storm", 1, Integer::sum) % 5 == 0) Bukkit.getScheduler().runTask(this, () -> {
                     if (!victim.isValid() || victim.isDead()) return;
                     victim.getWorld().strikeLightningEffect(victim.getLocation());
-                    trueDamage(victim, pf, 4.0);
+                    trueDamage(victim, pf, 2.0);
                 });
             }
             default -> {}

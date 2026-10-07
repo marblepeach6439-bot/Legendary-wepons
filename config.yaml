@@ -1,7 +1,7 @@
 # Optional: URL of the hosted resource pack zip (sent to players on join). Leave empty to disable.
 resource-pack-url: ""
 # SHA-1 of MarblesOpAhWeapons-ResourcePack.zip (makes players always download the newest pack)
-resource-pack-sha1: "a865bd508b077c804e9f561cd9a6db323a611dbe"
+resource-pack-sha1: "e20c38e9fd4b1a73192385b324f8afa00b9ffcea"
 resource-pack-required: false
 # Cooldowns in seconds
 cooldowns:
