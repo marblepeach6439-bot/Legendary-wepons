@@ -349,6 +349,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             return false;
         }
         cooldowns.put(k, now + getConfig().getInt("cooldowns." + key, def) * 1000L);
+        if (!quiet) castBurst(p, key);
         return true;
     }
 
@@ -806,31 +807,79 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         }, 240L);
     }
 
+    LivingEntity spawnClone(Player p, Location loc) {
+        String tag = "mow_clone_" + UUID.randomUUID().toString().replace("-", "");
+        World w = loc.getWorld();
+        String cmd = String.format(Locale.ROOT,
+                "execute in %s run summon minecraft:mannequin %.2f %.2f %.2f {Tags:[\"%s\"],NoGravity:1b,Invulnerable:1b,Silent:1b,immovable:1b,hide_description:1b,Rotation:[%.1ff,0.0f],profile:{name:\"%s\"}}",
+                w.getKey(), loc.getX(), loc.getY(), loc.getZ(), tag, loc.getYaw(), p.getName());
+        try { Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd); } catch (Exception ignored) { }
+        for (Entity en : w.getNearbyEntities(loc, 2, 2, 2)) {
+            if (en instanceof LivingEntity le && en.getScoreboardTags().contains(tag)) {
+                EntityEquipment eq = le.getEquipment();
+                if (eq != null) {
+                    eq.setArmorContents(p.getInventory().getArmorContents());
+                    eq.setItemInMainHand(p.getInventory().getItemInMainHand());
+                }
+                return le;
+            }
+        }
+        return null;
+    }
+
     void fractureClone(Player p, LivingEntity t, int idx, double dmg) {
         if (!t.isValid() || t.isDead() || !p.isOnline()) return;
         double ang = idx * (Math.PI * 2 / 5) + Math.random();
         Location loc = t.getLocation().add(Math.cos(ang) * 2.5, 0, Math.sin(ang) * 2.5);
         loc.setDirection(t.getLocation().toVector().subtract(loc.toVector()));
-        ArmorStand as = t.getWorld().spawn(loc, ArmorStand.class, a -> {
-            a.setArms(true); a.setBasePlate(false); a.setInvulnerable(true); a.setGravity(false); a.setSilent(true);
-            a.getEquipment().setArmorContents(p.getInventory().getArmorContents());
-            a.getEquipment().setItemInMainHand(p.getInventory().getItemInMainHand());
-        });
-        sp(loc.getWorld(), Particle.PORTAL, loc.clone().add(0, 1, 0), 40, .3, .8, .3, .3);
+        World w = loc.getWorld();
+        LivingEntity made = spawnClone(p, loc);          // a mannequin wearing the caster's skin
+        if (made == null) {                              // fallback if the server cannot spawn mannequins
+            made = w.spawn(loc, ArmorStand.class, as -> {
+                as.setArms(true); as.setBasePlate(false); as.setInvulnerable(true); as.setGravity(false); as.setSilent(true);
+                as.getEquipment().setArmorContents(p.getInventory().getArmorContents());
+                as.getEquipment().setItemInMainHand(p.getInventory().getItemInMainHand());
+            });
+        }
+        final LivingEntity ce = made;
+        sp(w, Particle.PORTAL, loc.clone().add(0, 1, 0), 60, .3, .8, .3, .5);
+        sp(w, Particle.END_ROD, loc.clone().add(0, 1, 0), 30, .3, .8, .3, 0.1);
+        expandRing(loc, 2.5, 6, l -> { dustAt(l, 50, 230, 100, 1.6f, 1, 0.05); dustAt(l, 255, 205, 60, 1.2f, 1, 0.05); });
+        w.playSound(loc, Sound.ENTITY_ENDERMAN_TELEPORT, 0.8f, 1.6f);
+        new BukkitRunnable() {          // flickering afterimage trail
+            int n = 0;
+            @Override public void run() {
+                if (!ce.isValid() || n++ > 16) { cancel(); return; }
+                Location b = ce.getLocation();
+                for (int k = 0; k < 4; k++) {
+                    Location l = b.clone().add((Math.random() - .5) * 0.8, Math.random() * 1.8, (Math.random() - .5) * 0.8);
+                    dustAt(l, 50, 230, 100, 1.2f, 1, 0.02);
+                    if (k == 0) sp(w, Particle.END_ROD, l, 1, 0, 0, 0, 0.01);
+                }
+            }
+        }.runTaskTimer(this, 0, 1);
         Bukkit.getScheduler().runTaskLater(this, () -> {      // slash 1 deals the damage
             if (!t.isValid() || t.isDead()) return;
-            sp(t.getWorld(), Particle.SWEEP_ATTACK, t.getLocation().add(0, 1, 0), 3, .4, .4, .4, 0);
-            t.getWorld().playSound(t.getLocation(), Sound.ENTITY_PLAYER_ATTACK_SWEEP, 1f, 0.8f);
+            ce.swingMainHand();
+            Location from = ce.getLocation().add(0, 1.4, 0), to = t.getLocation().add(0, 1, 0);
+            beam(from, to, 0.25, l -> { dustAt(l, 255, 205, 60, 1.5f, 1, 0.03); dustAt(l, 50, 230, 100, 1.3f, 1, 0.03); });
+            sp(w, Particle.SWEEP_ATTACK, to, 3, .4, .4, .4, 0);
+            sp(w, Particle.CRIT, to, 25, .4, .5, .4, 0.4);
+            w.playSound(t.getLocation(), Sound.ENTITY_PLAYER_ATTACK_SWEEP, 1f, 0.8f);
             trueDamage(t, p, dmg);
         }, 3L);
         Bukkit.getScheduler().runTaskLater(this, () -> {      // slash 2 is the afterimage
             if (!t.isValid()) return;
-            sp(t.getWorld(), Particle.SWEEP_ATTACK, t.getLocation().add(0, 1.2, 0), 3, .4, .4, .4, 0);
-            sp(t.getWorld(), Particle.END_ROD, loc.clone().add(0, 1, 0), 20, .3, .8, .3, 0.05);
+            ce.swingMainHand();
+            Location from = ce.getLocation().add(0, 0.6, 0), to = t.getLocation().add(0, 1.4, 0);
+            beam(from, to, 0.25, l -> { dustAt(l, 50, 230, 100, 1.5f, 1, 0.03); sp(w, Particle.END_ROD, l, 1, 0, 0, 0, 0.01); });
+            sp(w, Particle.SWEEP_ATTACK, to, 3, .4, .4, .4, 0);
+            w.playSound(t.getLocation(), Sound.ENTITY_PLAYER_ATTACK_SWEEP, 1f, 1.2f);
         }, 9L);
         Bukkit.getScheduler().runTaskLater(this, () -> {
-            sp(loc.getWorld(), Particle.PORTAL, loc.clone().add(0, 1, 0), 30, .3, .8, .3, .3);
-            as.remove();
+            sp(w, Particle.PORTAL, ce.getLocation().add(0, 1, 0), 50, .3, .8, .3, .5);
+            sp(w, Particle.END_ROD, ce.getLocation().add(0, 1, 0), 20, .3, .8, .3, 0.1);
+            ce.remove();
         }, 16L);
     }
 
@@ -1218,6 +1267,35 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         };
     }
 
+    int[] keyColor(String key) {
+        return switch (key) {
+            case "bloodbath" -> new int[]{220, 15, 30};
+            case "blinding_eclipse" -> new int[]{120, 40, 190};
+            case "lightning_storm", "tides_call" -> new int[]{110, 200, 255};
+            case "call_of_the_deep" -> new int[]{170, 170, 160};
+            case "stunning_strike", "durability_drain" -> new int[]{255, 120, 50};
+            case "void_walk", "pull_of_the_void", "void_throw" -> new int[]{160, 70, 255};
+            case "acidic_blaze", "incineration" -> new int[]{255, 150, 30};
+            case "sculk_beams", "summon_warden", "live_for_the_hunt" -> new int[]{40, 210, 230};
+            case "royal_judgement", "piercing_strike", "smite" -> new int[]{255, 205, 60};
+            case "temporal_cleave", "temporal_dismemberment" -> new int[]{50, 230, 100};
+            default -> new int[]{255, 255, 255};
+        };
+    }
+
+    void castBurst(Player p, String key) {
+        int[] c = keyColor(key);
+        World w = p.getWorld(); Location b = p.getLocation();
+        for (int i = 0; i < 48; i++) {           // rising double spiral
+            double a = i * 0.45;
+            dustAt(b.clone().add(Math.cos(a) * 1.1, i * 0.05, Math.sin(a) * 1.1), c[0], c[1], c[2], 1.5f, 1, 0.02);
+            dustAt(b.clone().add(Math.cos(a + Math.PI) * 1.1, i * 0.05, Math.sin(a + Math.PI) * 1.1), c[0], c[1], c[2], 1.5f, 1, 0.02);
+        }
+        sp(w, Particle.END_ROD, b.clone().add(0, 1, 0), 40, .6, .9, .6, 0.1);
+        sp(w, Particle.FIREWORK, b.clone().add(0, 1, 0), 20, .5, .8, .5, 0.1);
+        expandRing(b, 4, 8, l -> dustAt(l, c[0], c[1], c[2], 1.7f, 1, 0.02));
+    }
+
     void hud(Player p, String id) {
         if (!getConfig().getBoolean("cooldown-hud", true)) return;
         Long hold = holdUntil.get(p.getUniqueId());
@@ -1460,7 +1538,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     void callOfTheDeep(Player p) {
         if (!cd(p, "call_of_the_deep", 120)) return;
-        int R = getConfig().getInt("dome-radius", 20);
+        int R = getConfig().getInt("dome-radius", 10);
         Location c = p.getLocation(); World w = c.getWorld(); Random rnd = new Random();
         List<Block> shell = new ArrayList<>(), floor = new ArrayList<>();
         for (int x = -R - 1; x <= R + 1; x++) for (int y = -R - 1; y <= R + 1; y++) for (int z = -R - 1; z <= R + 1; z++) {
@@ -1504,6 +1582,24 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             }
         }.runTaskTimer(this, 0, 1);
         Bukkit.getScheduler().runTaskLater(this, () -> restoreDome(order), 1200L);
+        new BukkitRunnable() {          // everything hostile inside is slowed (Slowness II); the walls shimmer
+            int n = 0;
+            @Override public void run() {
+                if (n++ >= 60) { cancel(); return; }                 // 60 x 1 second = the dome's lifetime
+                for (Entity en : w.getNearbyEntities(c, R, R, R)) {
+                    if (en == p || !(en instanceof LivingEntity le) || en instanceof ArmorStand) continue;
+                    if (!(le instanceof Player || le instanceof Enemy)) continue;
+                    if (le.getLocation().distanceSquared(c) > (double) R * R) continue;
+                    le.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 60, 1, true, true, true));
+                    dustAt(le.getLocation().add(0, 1, 0), 130, 130, 130, 1.2f, 6, 0.4);
+                    sp(w, Particle.CRIT, le.getLocation().add(0, 0.2, 0), 3, .3, .1, .3, 0.02);
+                }
+                for (int k = 0; k < 40 && !order.isEmpty(); k++) {
+                    Block b = order.get(rnd.nextInt(order.size()));
+                    sp(w, Particle.ENCHANT, b.getLocation().add(0.5, 0.5, 0.5), 2, .3, .3, .3, 0.3);
+                }
+            }
+        }.runTaskTimer(this, 20, 20);
     }
 
     boolean isOre(Material m) { return m == Material.ANCIENT_DEBRIS || m.name().endsWith("_ORE"); }
