@@ -7,6 +7,8 @@ import net.kyori.adventure.text.format.TextDecoration;
 import org.bukkit.*;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
+import org.bukkit.attribute.Attribute;
+import org.bukkit.attribute.AttributeModifier;
 import org.bukkit.block.Container;
 import org.bukkit.block.TileState;
 import org.bukkit.block.data.BlockData;
@@ -64,6 +66,8 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     final Map<UUID, Incin> incin = new HashMap<>();
     final Map<Material, Material> smelt = new HashMap<>();
     final Map<UUID, Long> lungeCd = new HashMap<>();
+    final Map<UUID, String> lastMaceId = new HashMap<>();     // for attribute swapping: the mace held a moment ago
+    final Map<UUID, Long> lastMaceTime = new HashMap<>();
     final Map<UUID, Integer> airHits = new HashMap<>();   // mace hits since last touching the ground
     final Map<UUID, Thrown> thrown = new HashMap<>();
     final Map<UUID, Long> holdUntil = new HashMap<>();   // action-bar message hold (HUD pauses)
@@ -95,7 +99,10 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 Set<UUID> axeCarriers = new HashSet<>();
                 for (Player p : Bukkit.getOnlinePlayers()) {
                     String id = id(p.getInventory().getItemInMainHand());
-                    if (id != null) { auraFx(p, id); hud(p, id); }
+                    if (id != null) {
+                        auraFx(p, id); hud(p, id);
+                        if (id.equals("divine_judgement") || id.equals("hammer_of_the_void")) recordMace(p, id);
+                    }
                     if ("kings_crown".equals(id(p.getInventory().getHelmet())) && t % 2 == 0) {
                         Location h = p.getEyeLocation().add(0, 0.55, 0);
                         sp(p.getWorld(), Particle.END_ROD, h, 1, 0.25, 0.05, 0.25, 0.01);
@@ -259,6 +266,12 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         meta.lore(l);
         for (Map.Entry<Enchantment, Integer> e : en.entrySet()) meta.addEnchant(e.getKey(), e.getValue(), true);
         meta.setUnbreakable(true);
+        if (id.equals("stormcaller")) {
+            meta.addAttributeModifier(Attribute.ATTACK_DAMAGE, new AttributeModifier(new NamespacedKey("dwarvenweapons", "trident_damage"),
+                    8.0, AttributeModifier.Operation.ADD_NUMBER, EquipmentSlotGroup.MAINHAND));
+            meta.addAttributeModifier(Attribute.ATTACK_SPEED, new AttributeModifier(new NamespacedKey("dwarvenweapons", "trident_speed"),
+                    -2.4, AttributeModifier.Operation.ADD_NUMBER, EquipmentSlotGroup.MAINHAND));   // 4.0 - 2.4 = 1.6, same as a sword
+        }
         if (id.equals("kings_crown")) {
             EquippableComponent eq = meta.getEquippable();      // worn model: assets/dwarven/equipment/kings_crown.json
             eq.setSlot(EquipmentSlot.HEAD);
@@ -1201,6 +1214,29 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         for (double y = 0; y < height; y += 0.4) plot.accept(base.clone().add(0, y, 0));
     }
 
+    boolean isVanillaCrit(Player p) {
+        return p.getFallDistance() > 0 && !p.isOnGround() && !p.isInWater() && !p.isClimbing()
+                && !p.isInsideVehicle() && !p.isSprinting() && !p.hasPotionEffect(PotionEffectType.BLINDNESS);
+    }
+
+    void recordMace(Player p, String id) {
+        lastMaceId.put(p.getUniqueId(), id);
+        lastMaceTime.put(p.getUniqueId(), System.currentTimeMillis());
+    }
+
+    String recentMace(Player p) {          // a mace held in the last 0.8s still counts (attribute swapping)
+        Long t = lastMaceTime.get(p.getUniqueId());
+        String m = lastMaceId.get(p.getUniqueId());
+        if (t == null || m == null || System.currentTimeMillis() - t > 800) return null;
+        return hasWeapon(p, m) ? m : null;
+    }
+
+    @EventHandler
+    public void onHeldChange(PlayerItemHeldEvent e) {
+        String prev = id(e.getPlayer().getInventory().getItem(e.getPreviousSlot()));
+        if ("divine_judgement".equals(prev) || "hammer_of_the_void".equals(prev)) recordMace(e.getPlayer(), prev);
+    }
+
     void hitFx(LivingEntity v, String id) {
         World w = v.getWorld(); Location l = v.getLocation().add(0, v.getHeight() / 2, 0);
         switch (id) {
@@ -1910,6 +1946,11 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         if (mk != null && mk.holder().equals(p.getUniqueId()) && mk.end() > System.currentTimeMillis())
             e.setDamage(e.getDamage() * (1 + mk.bonus()));
 
+        if (!"divine_judgement".equals(id) && !"hammer_of_the_void".equals(id)) {     // attribute swapping: a mace held just now still counts
+            String lm = recentMace(p);
+            if (lm != null) maceHit(e, p, victim, lm);
+        }
+
         if (id == null) return;
         final Player pf = p;
         hitFx(victim, id);
@@ -1918,8 +1959,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "bloody_eclipse" -> {
                 Long end = bloodbath.get(p.getUniqueId());
                 if (end != null && end > System.currentTimeMillis()) {
-                    boolean vanillaCrit = p.getFallDistance() > 0 && !p.isOnGround() && !p.isInWater() && !p.isClimbing()
-                            && !p.isInsideVehicle() && !p.isSprinting() && !p.hasPotionEffect(PotionEffectType.BLINDNESS);
+                    boolean vanillaCrit = isVanillaCrit(p);
                     if (!vanillaCrit) e.setDamage(e.getDamage() * 1.5);       // vanilla crit multiplier (a real falling crit already has it)
                     World cw = victim.getWorld(); Location cl = victim.getLocation().add(0, victim.getHeight() * 0.6, 0);
                     cw.playSound(cl, Sound.ENTITY_PLAYER_ATTACK_CRIT, 1f, 0.9f);
@@ -1934,9 +1974,13 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 }
                 if (n % 25 == 0) bleed(victim, p);
             }
-            case "divine_judgement", "hammer_of_the_void" -> maceHit(e, p, victim, id);
+            case "divine_judgement", "hammer_of_the_void" -> { recordMace(p, id); maceHit(e, p, victim, id); }
             case "stormcaller" -> {
-                if (n % 5 == 0) Bukkit.getScheduler().runTask(this, () -> {
+                boolean thrownHit = e.getDamager() instanceof Trident;
+                boolean strongHit = !thrownHit && p.getAttackCooldown() >= 0.9f;          // not a weak (spam) hit
+                boolean sweepHit = e.getCause() == org.bukkit.event.entity.EntityDamageEvent.DamageCause.ENTITY_SWEEP_ATTACK;
+                boolean qualifies = sweepHit || (strongHit && (isVanillaCrit(p) || p.isSprinting()));   // crit, sweep or sprint hits only
+                if (qualifies && hitCounters.merge(p.getUniqueId() + "storm", 1, Integer::sum) % 5 == 0) Bukkit.getScheduler().runTask(this, () -> {
                     if (!victim.isValid() || victim.isDead()) return;
                     victim.getWorld().strikeLightningEffect(victim.getLocation());
                     trueDamage(victim, pf, 4.0);
