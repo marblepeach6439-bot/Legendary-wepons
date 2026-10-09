@@ -10,6 +10,16 @@ commands:
     usage: /dweapons <give|list|reload|pack|info> [player] [weapon]
     aliases: [weapons, dw, mow]
     permission: dwarven.admin
+  trust:
+    description: Trust a player - your weapon abilities will not hit them
+    usage: /trust <player> | /trust remove <player> | /trust list
+    permission: dwarven.trust
+  untrust:
+    description: Stop trusting a player
+    usage: /untrust <player>
+    permission: dwarven.trust
 permissions:
+  dwarven.trust:
+    default: true
   dwarven.admin:
     default: op

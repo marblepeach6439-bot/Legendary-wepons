@@ -15,6 +15,7 @@ import org.bukkit.block.data.BlockData;
 import org.bukkit.block.data.Waterlogged;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.*;
 import org.bukkit.event.EventHandler;
@@ -42,6 +43,7 @@ import org.bukkit.util.BoundingBox;
 import org.bukkit.util.RayTraceResult;
 import org.bukkit.util.Vector;
 
+import java.io.File;
 import java.util.*;
 import java.util.function.Consumer;
 
@@ -70,6 +72,9 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     final Map<UUID, Long> lastMaceTime = new HashMap<>();
     final Map<Block, BlockData> incinOrig = new HashMap<>();
     final Map<Block, Material> incinSet = new HashMap<>();
+    final Map<UUID, Set<UUID>> trusted = new HashMap<>();     // owner -> players they trust (allies)
+    File trustFile;
+    final Map<UUID, Long> kickImmune = new HashMap<>();       // players who may hover because of an ability (no fly kick)
     final Map<UUID, Integer> bleedHits = new HashMap<>();
     final Map<UUID, Integer> airHits = new HashMap<>();   // mace hits since last touching the ground
     final Map<UUID, Thrown> thrown = new HashMap<>();
@@ -92,6 +97,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         CROSS_KEY = new NamespacedKey("dwarvenweapons", "cocktail_arrow");
         getServer().getPluginManager().registerEvents(this, this);
         buildSmeltMap();
+        loadTrust();
         new BukkitRunnable() {
             @Override public void run() { for (Player p : Bukkit.getOnlinePlayers()) passives(p); }
         }.runTaskTimer(this, 20, 20);
@@ -165,7 +171,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.FIRE_ASPECT, 3);
                 en.put(Enchantment.MENDING, 1); en.put(Enchantment.UNBREAKING, 3);
                 lore = List.of("Ability 1 [F]: Bloodbath - every hit crits for 10s",
-                        "Ability 2 [Shift+F]: Blinding Eclipse - blind enemies, no wind charges/cobwebs 20s",
+                        "Ability 2 [Shift+F]: Blinding Eclipse - blind enemies, no wind charges/cobwebs 10s",
                         "Passive: Bleed every 5 hits (10s cooldown), Speed II, Strength I");
             }
             case "stormcaller" -> {
@@ -186,7 +192,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 mat = Material.NETHERITE_AXE; name = "10 Ton Axe"; col = TextColor.color(0xC8C8CD);
                 en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.UNBREAKING, 3);
                 en.put(Enchantment.MENDING, 1); en.put(Enchantment.EFFICIENCY, 5);
-                lore = List.of("Ability 1 [F]: Stunning Strike - stun 5s + 2 hearts true damage",
+                lore = List.of("Ability 1 [F]: Stunning Strike - stun 3s + 2 hearts true damage",
                         "Ability 2 [Shift+F]: Durability Drain - 2 hearts true damage + 30 armor durability");
             }
             case "void_blade" -> {
@@ -247,7 +253,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 mat = Material.NETHERITE_SWORD; name = "Temporal Reaver"; col = TextColor.color(0x32E164);
                 en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.FIRE_ASPECT, 2); en.put(Enchantment.LOOTING, 3);
                 en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
-                lore = List.of("Ability 1 [F]: Temporal Cleave - freezes time around you (players, mobs, projectiles) for 10s",
+                lore = List.of("Ability 1 [F]: Temporal Cleave - freezes time around you (players, mobs, projectiles) for 5s",
                         "Ability 2 [Shift+F]: Temporal Dismemberment - 3-phase execution of your crosshair target");
             }
             case "primal_bow" -> {
@@ -297,6 +303,8 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     // ------------------------------------------------------------------ command
     @Override
     public boolean onCommand(CommandSender s, Command c, String label, String[] a) {
+        String cn = c.getName().toLowerCase(Locale.ROOT);
+        if (cn.equals("trust") || cn.equals("untrust")) return handleTrust(s, cn, a);
         if (a.length == 0) { s.sendMessage("/dweapons <give|list|reload> [player] [weapon]"); return true; }
         switch (a[0].toLowerCase()) {
             case "list" -> s.sendMessage("Weapons: " + String.join(", ", IDS));
@@ -323,6 +331,14 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     @Override
     public List<String> onTabComplete(CommandSender s, Command c, String l, String[] a) {
+        String cn = c.getName().toLowerCase(Locale.ROOT);
+        if (cn.equals("trust") || cn.equals("untrust")) {
+            List<String> o = new ArrayList<>();
+            if (cn.equals("trust") && a.length == 1) o.addAll(List.of("list", "remove"));
+            if (a.length <= 2) Bukkit.getOnlinePlayers().forEach(pl -> o.add(pl.getName()));
+            o.removeIf(x -> !x.toLowerCase(Locale.ROOT).startsWith(a[a.length - 1].toLowerCase(Locale.ROOT)));
+            return o;
+        }
         List<String> out = new ArrayList<>();
         if (a.length == 1) out.addAll(List.of("give", "list", "reload", "pack", "info"));
         else if (a.length == 2 && a[0].equalsIgnoreCase("give")) Bukkit.getOnlinePlayers().forEach(p -> out.add(p.getName()));
@@ -358,6 +374,78 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     @EventHandler
     public void onPackStatus(PlayerResourcePackStatusEvent e) { packStatus.put(e.getPlayer().getUniqueId(), e.getStatus().name()); }
 
+    // ------------------------------------------------------------------ trust system
+    void loadTrust() {
+        trustFile = new File(getDataFolder(), "trusted.yml");
+        trusted.clear();
+        if (!trustFile.exists()) return;
+        YamlConfiguration y = YamlConfiguration.loadConfiguration(trustFile);
+        for (String k : y.getKeys(false)) {
+            try {
+                Set<UUID> set = new HashSet<>();
+                for (String u : y.getStringList(k)) set.add(UUID.fromString(u));
+                trusted.put(UUID.fromString(k), set);
+            } catch (IllegalArgumentException ignored) { }
+        }
+    }
+
+    void saveTrust() {
+        YamlConfiguration y = new YamlConfiguration();
+        for (Map.Entry<UUID, Set<UUID>> en : trusted.entrySet()) {
+            List<String> l = new ArrayList<>();
+            for (UUID u : en.getValue()) l.add(u.toString());
+            y.set(en.getKey().toString(), l);
+        }
+        try { getDataFolder().mkdirs(); y.save(trustFile); }
+        catch (java.io.IOException ex) { getLogger().warning("Could not save trusted.yml: " + ex.getMessage()); }
+    }
+
+    /** true when `e` is a player that `owner` has trusted - the owner's abilities never hit them */
+    boolean ally(Player owner, Entity e) {
+        if (owner == null || !(e instanceof Player other)) return false;
+        Set<UUID> set = trusted.get(owner.getUniqueId());
+        return set != null && set.contains(other.getUniqueId());
+    }
+
+    boolean handleTrust(CommandSender s, String cn, String[] a) {
+        if (!(s instanceof Player p)) { s.sendMessage("Only players can use this."); return true; }
+        Set<UUID> set = trusted.computeIfAbsent(p.getUniqueId(), k -> new HashSet<>());
+        if (cn.equals("trust") && (a.length == 0 || a[0].equalsIgnoreCase("list"))) {
+            if (set.isEmpty()) { p.sendMessage(Component.text("You do not trust anyone. Use /trust <player>.", NamedTextColor.GRAY)); return true; }
+            List<String> names = new ArrayList<>();
+            for (UUID u : set) { String n = Bukkit.getOfflinePlayer(u).getName(); names.add(n == null ? u.toString() : n); }
+            p.sendMessage(Component.text("Trusted players: " + String.join(", ", names), NamedTextColor.GREEN));
+            return true;
+        }
+        boolean remove = cn.equals("untrust") || (a.length >= 2 && a[0].equalsIgnoreCase("remove"));
+        String name = (a.length >= 2 && (a[0].equalsIgnoreCase("remove") || a[0].equalsIgnoreCase("add"))) ? a[1] : (a.length >= 1 ? a[0] : null);
+        if (name == null) { p.sendMessage(Component.text("Usage: /trust <player>, /trust remove <player>, /untrust <player>, /trust list", NamedTextColor.GRAY)); return true; }
+        OfflinePlayer t = Bukkit.getPlayerExact(name) != null ? Bukkit.getPlayerExact(name) : Bukkit.getOfflinePlayer(name);
+        if (!t.isOnline() && !t.hasPlayedBefore()) { p.sendMessage(Component.text("Unknown player: " + name, NamedTextColor.RED)); return true; }
+        if (t.getUniqueId().equals(p.getUniqueId())) { p.sendMessage(Component.text("You always count as yourself.", NamedTextColor.GRAY)); return true; }
+        String shown = t.getName() == null ? name : t.getName();
+        if (remove) {
+            if (set.remove(t.getUniqueId())) { saveTrust(); p.sendMessage(Component.text("You no longer trust " + shown + ".", NamedTextColor.YELLOW)); }
+            else p.sendMessage(Component.text(shown + " was not trusted.", NamedTextColor.GRAY));
+        } else {
+            if (set.add(t.getUniqueId())) { saveTrust(); p.sendMessage(Component.text("You now trust " + shown + ". Your abilities will not hit them.", NamedTextColor.GREEN)); }
+            else p.sendMessage(Component.text(shown + " is already trusted.", NamedTextColor.GRAY));
+        }
+        return true;
+    }
+
+    // ------------------------------------------------------------------ fly kick protection
+    void noKick(Player p, long ms) { kickImmune.merge(p.getUniqueId(), System.currentTimeMillis() + ms, Long::max); }
+
+    @EventHandler
+    public void onFlyKick(PlayerKickEvent e) {
+        Player p = e.getPlayer();
+        Long u = kickImmune.get(p.getUniqueId());
+        if (!((u != null && u > System.currentTimeMillis()) || isStunned(p))) return;
+        String reason = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(e.reason()).toLowerCase(Locale.ROOT);
+        if (reason.contains("flying")) e.setCancelled(true);       // "Flying is not enabled on this server"
+    }
+
     // ------------------------------------------------------------------ helpers
     boolean cd(Player p, String key, int def) { return cd(p, key, def, false); }
 
@@ -374,13 +462,34 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         return true;
     }
 
+    boolean tryTotem(Player p) {
+        PlayerInventory inv = p.getInventory();
+        if (inv.getItemInOffHand().getType() == Material.TOTEM_OF_UNDYING) {
+            ItemStack it = inv.getItemInOffHand();
+            if (it.getAmount() > 1) { it.setAmount(it.getAmount() - 1); inv.setItemInOffHand(it); } else inv.setItemInOffHand(null);
+        } else if (inv.getItemInMainHand().getType() == Material.TOTEM_OF_UNDYING) {
+            ItemStack it = inv.getItemInMainHand();
+            if (it.getAmount() > 1) { it.setAmount(it.getAmount() - 1); inv.setItemInMainHand(it); } else inv.setItemInMainHand(null);
+        } else return false;
+        p.setHealth(1.0);
+        p.clearActivePotionEffects();
+        p.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, 900, 1));
+        p.addPotionEffect(new PotionEffect(PotionEffectType.ABSORPTION, 100, 1));
+        p.addPotionEffect(new PotionEffect(PotionEffectType.FIRE_RESISTANCE, 800, 0));
+        p.playEffect(EntityEffect.TOTEM_RESURRECT);
+        return true;
+    }
+
     void trueDamage(LivingEntity t, Player src, double amt) {
         if (t == null || t.isDead() || !t.isValid()) return;
         if (t instanceof Player pl && (pl.getGameMode() == GameMode.CREATIVE || pl.getGameMode() == GameMode.SPECTATOR)) return;
         internal = true;
         try { if (src != null) t.damage(0.01, src); else t.damage(0.01); } finally { internal = false; }
         double nh = t.getHealth() - amt;
-        if (nh <= 0) t.setHealth(0); else t.setHealth(nh);
+        if (nh <= 0) {
+            if (t instanceof Player tp && tryTotem(tp)) return;       // a totem saves them, like vanilla
+            t.setHealth(0);
+        } else t.setHealth(nh);
     }
 
     void effect(Player p, PotionEffectType t, int amp) {
@@ -396,7 +505,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     LivingEntity lookTarget(Player p, int range) {
         Entity t = p.getTargetEntity(range);
-        return (t instanceof LivingEntity le && !(t instanceof ArmorStand)) ? le : null;
+        return (t instanceof LivingEntity le && !(t instanceof ArmorStand) && !ally(p, t)) ? le : null;
     }
 
 
@@ -550,6 +659,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                     Vector v = p.getLocation().toVector().subtract(t.getLocation().toVector());
                     if (v.length() < 2.5) { cancel(); return; }
                     t.setVelocity(v.normalize().multiply(1.1).setY(0.25));   // pull toward the wielder
+                    if (t instanceof Player kp) noKick(kp, 4000);
                     beam(t.getLocation().add(0, 1, 0), p.getLocation().add(0, 1, 0), 0.7, l -> { sp(w, Particle.END_ROD, l, 1); dustAt(l, 255, 215, 90, 1.2f, 1, 0.05); });
                 }
             }.runTaskTimer(this, 0, 1);
@@ -574,7 +684,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 fw.strikeLightningEffect(l);
                 l.getWorld().playSound(l, Sound.ENTITY_GENERIC_EXPLODE, 1.2f, 1f);
                 for (Entity en : v.getNearbyEntities(3, 3, 3))
-                    if (en instanceof LivingEntity le && en != p && !(en instanceof ArmorStand)) drainAllArmor(le, 60);
+                    if (en instanceof LivingEntity le && en != p && !(en instanceof ArmorStand) && !ally(p, en)) drainAllArmor(le, 60);
                 drainAllArmor(v, 60);
                 msg(p, Component.text("FINAL VERDICT", NamedTextColor.GOLD));
                 airHits.remove(u);
@@ -714,14 +824,14 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     void temporalCleave(Player p) {
         if (!cd(p, "temporal_cleave", 90)) return;
         int r = getConfig().getInt("temporal-cleave.radius", 25);
-        int ticks = getConfig().getInt("temporal-cleave.duration-seconds", 10) * 20;
+        int ticks = getConfig().getInt("temporal-cleave.duration-seconds", 5) * 20;
         Location c = p.getLocation();
         List<LivingEntity> frozen = new ArrayList<>();
         Map<Projectile, Vector> proj = new HashMap<>();
         for (Entity en : p.getNearbyEntities(r, r, r)) {
             if (en.getLocation().distanceSquared(c) > (double) r * r) continue;
             if (en instanceof Projectile pr) { proj.put(pr, pr.getVelocity()); pr.setGravity(false); pr.setVelocity(new Vector()); }
-            else if (en instanceof LivingEntity le && !(en instanceof ArmorStand) && (en instanceof Player || en instanceof Mob)) { stun(le, ticks); frozen.add(le); }
+            else if (en instanceof LivingEntity le && !(en instanceof ArmorStand) && !ally(p, en) && (en instanceof Player || en instanceof Mob)) { stun(le, ticks); frozen.add(le); }
         }
         p.getWorld().playSound(c, Sound.ENTITY_ENDER_DRAGON_GROWL, 1.2f, 0.5f);
         ring(c, r, Particle.END_ROD);
@@ -979,6 +1089,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         beam(p.getEyeLocation().add(0, -0.2, 0), v.getLocation().add(0, 1, 0), 0.3, l -> { dustAt(l, 120, 255, 30, 1.5f, 1, 0.05); sp(gw, Particle.END_ROD, l, 1); });
         sp(gw, Particle.CLOUD, v.getLocation().add(0, 1, 0), 20, .3, .5, .3, 0.05);
         v.teleport(dest);
+        if (v instanceof Player kp) noKick(kp, 4000);
         sp(gw, Particle.CLOUD, dest.clone().add(0, 1, 0), 15, .3, .5, .3, 0.05);
         gw.playSound(dest, Sound.ENTITY_FISHING_BOBBER_RETRIEVE, 1f, 0.7f);
     }
@@ -1059,7 +1170,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         p.getWorld().playSound(p.getLocation(), Sound.ENTITY_WARDEN_SONIC_BOOM, 0.8f, 1.6f);
         Location mid = eye.clone().add(dir.clone().multiply(15));
         for (Entity en : p.getWorld().getNearbyEntities(mid, 16, 16, 16)) {
-            if (en == p || !(en instanceof LivingEntity le) || en instanceof ArmorStand) continue;
+            if (en == p || !(en instanceof LivingEntity le) || en instanceof ArmorStand || ally(p, en)) continue;
             BoundingBox box = en.getBoundingBox().expand(0.3);
             RayTraceResult r = box.rayTrace(eye.toVector(), dir, 30);
             if (r != null) {                                  // goes through blocks: no block check
@@ -1436,12 +1547,12 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     void blindingEclipse(Player p) {
         if (!cd(p, "blinding_eclipse", 60)) return;
-        long end = System.currentTimeMillis() + 20_000;
+        long end = System.currentTimeMillis() + 10_000;
         World w = p.getWorld(); Location c = p.getLocation();
         for (Entity en : p.getNearbyEntities(20, 20, 20)) {
-            if (!(en instanceof LivingEntity le) || en instanceof ArmorStand) continue;
+            if (!(en instanceof LivingEntity le) || en instanceof ArmorStand || ally(p, en)) continue;
             if (en.getLocation().distanceSquared(c) > 400) continue;
-            le.addPotionEffect(new PotionEffect(PotionEffectType.BLINDNESS, 400, 0));
+            le.addPotionEffect(new PotionEffect(PotionEffectType.BLINDNESS, 200, 0));
             sp(w, Particle.SQUID_INK, le.getEyeLocation(), 16, .3, .3, .3, 0.05);
             if (en instanceof Player v) eclipsed.put(v.getUniqueId(), end);
         }
@@ -1540,10 +1651,11 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             @Override public void run() {
                 if (!p.isOnline() || n++ >= 100) { cancel(); return; }
                 for (Entity en : p.getNearbyEntities(20, 20, 20)) {
-                    if (!(en instanceof LivingEntity le) || en instanceof ArmorStand) continue;
+                    if (!(en instanceof LivingEntity le) || en instanceof ArmorStand || ally(p, en)) continue;
                     if (en.getLocation().distanceSquared(p.getLocation()) > 400) continue;
                     Vector v = p.getLocation().toVector().subtract(en.getLocation().toVector());
                     if (v.lengthSquared() > 9) en.setVelocity(v.normalize().multiply(0.7).setY(0.12));   // fast pull
+                    if (en instanceof Player kp) noKick(kp, 4000);
                     if (!(en instanceof WaterMob) && !(en instanceof Drowned) && !le.hasPotionEffect(PotionEffectType.WATER_BREATHING))
                         le.setRemainingAir(Math.max(-20, le.getRemainingAir() - 12));
                     sp(w, Particle.BUBBLE_POP, en.getLocation().add(0, 1, 0), 5, .3, .5, .3);
@@ -1631,7 +1743,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             @Override public void run() {
                 if (n++ >= 60) { cancel(); return; }                 // 60 x 1 second = the dome's lifetime
                 for (Entity en : w.getNearbyEntities(c, R, R, R)) {
-                    if (en == p || !(en instanceof LivingEntity le) || en instanceof ArmorStand) continue;
+                    if (en == p || !(en instanceof LivingEntity le) || en instanceof ArmorStand || ally(p, en)) continue;
                     if (!(le instanceof Player || le instanceof Enemy)) continue;
                     if (le.getLocation().distanceSquared(c) > (double) R * R) continue;
                     le.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 60, 1, true, true, true));
@@ -1710,6 +1822,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     void stun(LivingEntity t, int ticks) {
         t.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, ticks, 6, false, false));
         if (t instanceof Player pl) {
+            noKick(pl, ticks * 50L + 5000);
             stunned.put(pl.getUniqueId(), System.currentTimeMillis() + ticks * 50L);
             pl.addPotionEffect(new PotionEffect(PotionEffectType.JUMP_BOOST, ticks, 128, false, false));
         } else if (t instanceof Mob m) {
@@ -1722,7 +1835,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         LivingEntity t = lookTarget(p, 6);
         if (t == null) { msg(p, Component.text("No target in reach", NamedTextColor.GRAY)); return; }
         if (!cd(p, "stunning_strike", 30)) return;
-        stun(t, 100);
+        stun(t, 60);
         trueDamage(t, p, 4.0);
         World w = t.getWorld(); Location g = t.getLocation();
         w.playSound(g, Sound.ENTITY_IRON_GOLEM_ATTACK, 1f, 0.6f);
@@ -1823,7 +1936,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     void pullOfTheVoid(Player p) {
         Location eye = p.getEyeLocation();
         RayTraceResult r = p.getWorld().rayTraceEntities(eye, eye.getDirection(), 40, 0.6,
-                en -> en != p && en instanceof LivingEntity && !(en instanceof ArmorStand) && !en.isDead());
+                en -> en != p && en instanceof LivingEntity && !(en instanceof ArmorStand) && !en.isDead() && !ally(p, en));
         if (r == null || r.getHitEntity() == null) { msg(p, Component.text("No target in sight", NamedTextColor.GRAY)); return; }
         if (!cd(p, "pull_of_the_void", 30)) return;
         Entity t = r.getHitEntity();
@@ -1839,6 +1952,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         expandRing(t.getLocation(), 3, 6, l -> dustAt(l, 150, 60, 255, 1.5f, 1, 0.05));
         dest.setYaw(t.getLocation().getYaw()); dest.setPitch(t.getLocation().getPitch());
         t.teleport(dest);
+        if (t instanceof Player kp) noKick(kp, 4000);
         sp(w, Particle.REVERSE_PORTAL, dest.clone().add(0, 1, 0), 60, .4, .8, .4, 0.4);
         t.getWorld().playSound(dest, Sound.ENTITY_ENDERMAN_TELEPORT, 1f, 0.6f);
     }
@@ -2009,6 +2123,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         else return;
 
         if (isStunned(p)) { e.setCancelled(true); return; }
+        if (ally(p, victim)) return;            // trusted players: no weapon effects on them
 
         // Inferno - Incineration: players in the area take 1.25x damage from the wielder
         Incin in = incin.get(p.getUniqueId());
