@@ -8,6 +8,7 @@ import org.bukkit.*;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.attribute.Attribute;
+import org.bukkit.attribute.AttributeInstance;
 import org.bukkit.attribute.AttributeModifier;
 import org.bukkit.block.Container;
 import org.bukkit.block.TileState;
@@ -23,10 +24,14 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.*;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.entity.EntityTargetLivingEntityEvent;
 import org.bukkit.event.entity.ProjectileLaunchEvent;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.player.*;
 import org.bukkit.inventory.*;
 import org.bukkit.inventory.meta.Damageable;
@@ -51,7 +56,9 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     static final List<String> IDS = List.of("bloody_eclipse", "stormcaller", "dwarven_pickaxe",
             "ten_ton_axe", "void_blade", "inferno", "sculk_battle_axe", "royal_spear", "kings_crown", "divine_judgement", "hammer_of_the_void",
-            "temporal_reaver", "primal_bow", "mad_scientists_crossbow");
+            "temporal_reaver", "primal_bow", "mad_scientists_crossbow",
+            "kings_shield", "kings_plate", "kings_legguards", "kings_step", "chrono_blade", "soul_reaper",
+            "dragons_rend", "axe_of_abyss", "divine_executioner", "priests_staff", "gamblers_sword");
 
     NamespacedKey KEY, HUNT_KEY, PRIMAL_KEY, CROSS_KEY;
     boolean internal = false;   // guard for our own true-damage calls
@@ -76,6 +83,23 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     File trustFile;
     final Map<UUID, Long> kickImmune = new HashMap<>();       // players who may hover because of an ability (no fly kick)
     final Map<UUID, Integer> bleedHits = new HashMap<>();
+    final Random rng = new Random();
+    final Map<UUID, Long> reprisal = new HashMap<>();
+    final Map<UUID, Long> decree = new HashMap<>();
+    final Map<UUID, AttributeModifier> decreeMods = new HashMap<>();
+    final Map<UUID, Long> voidWeak = new HashMap<>();
+    final Map<UUID, WarpState> warps = new HashMap<>();
+    static class WarpState { Location loc; double health; int food; }
+    final Map<UUID, Domain> domains = new HashMap<>();
+    record Domain(Location center, int radius, long end) {}
+    final List<Rift> rifts = new ArrayList<>();
+    static class Rift { Location loc; UUID owner; long end; }
+    final Map<UUID, SacGui> sacGuis = new HashMap<>();
+    static class SacGui { Inventory inv; }
+    final Map<UUID, Integer> doubleHits = new HashMap<>();
+    final Map<UUID, Integer> fortuneHits = new HashMap<>();
+    final Map<UUID, Integer> houseBonus = new HashMap<>();
+    final Map<UUID, Integer> doubleStreak = new HashMap<>();
     final Map<UUID, Integer> airHits = new HashMap<>();   // mace hits since last touching the ground
     final Map<UUID, Thrown> thrown = new HashMap<>();
     final Map<UUID, Long> holdUntil = new HashMap<>();   // action-bar message hold (HUD pauses)
@@ -105,13 +129,14 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             int t = 0;
             @Override public void run() {
                 t++;
+                tickRifts();
                 Set<UUID> axeCarriers = new HashSet<>();
                 for (Player p : Bukkit.getOnlinePlayers()) {
                     String id = id(p.getInventory().getItemInMainHand());
                     if (id != null) {
                         auraFx(p, id); hud(p, id);
                         if (id.equals("divine_judgement") || id.equals("hammer_of_the_void")) recordMace(p, id);
-                    }
+                    } else armourHud(p);
                     if ("kings_crown".equals(id(p.getInventory().getHelmet())) && t % 2 == 0) {
                         Location h = p.getEyeLocation().add(0, 0.55, 0);
                         sp(p.getWorld(), Particle.END_ROD, h, 1, 0.25, 0.05, 0.25, 0.01);
@@ -173,6 +198,23 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 lore = List.of("Ability 1 [F]: Bloodbath - every hit crits for 10s",
                         "Ability 2 [Shift+F]: Blinding Eclipse - blind enemies, no wind charges/cobwebs 10s",
                         "Passive: Bleed every 5 hits (10s cooldown), Speed II, Strength I");
+            }
+            case "gamblers_sword" -> {
+                UUID gu = p.getUniqueId();
+                Integer dh = doubleHits.get(gu);
+                if (dh != null && dh > 0) {
+                    e.setDamage(e.getDamage() * 1.5);                // Double: next 5 attacks deal 1.5x
+                    if (dh <= 1) doubleHits.remove(gu); else doubleHits.put(gu, dh - 1);
+                }
+                double extra = 0;
+                Integer fh = fortuneHits.get(gu);
+                if (fh != null && fh > 0) {                          // Fortune: next 3 attacks +2 hearts true damage
+                    extra += 4.0;
+                    if (fh <= 1) fortuneHits.remove(gu); else fortuneHits.put(gu, fh - 1);
+                }
+                if (houseBonus.remove(gu) != null) extra += 2.0;     // House Edge: +1 heart on the next hit
+                if (n % 10 == 0) houseEdge(p);
+                if (extra > 0) { final double fxd = extra; Bukkit.getScheduler().runTask(this, () -> trueDamage(victim, pf, fxd)); }
             }
             case "stormcaller" -> {
                 mat = Material.TRIDENT; name = "Stormcaller"; col = TextColor.color(0x5AC8FF);
@@ -270,6 +312,73 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 lore = List.of("Passive: Furious Cocktail - every arrow carries a random potion effect (never instant damage/health)",
                         "Passive: Grapple - every hit pulls the enemy 5 blocks toward you");
             }
+            case "kings_shield" -> {
+                mat = Material.SHIELD; name = "King's Shield"; col = TextColor.color(0xE2B560);
+                en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability [/armour ability 1]: Imperial Reprisal - the next attack you block is reflected back:",
+                        "3 hearts true damage + knockback (30s cooldown)");
+            }
+            case "kings_plate" -> {
+                mat = Material.NETHERITE_CHESTPLATE; name = "King's Plate"; col = TextColor.color(0xE2B560);
+                en.put(Enchantment.PROTECTION, 4); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability [/armour ability 2]: Imperial Decree - 5s: no knockback and 50% less damage (30s cooldown)");
+            }
+            case "kings_legguards" -> {
+                mat = Material.NETHERITE_LEGGINGS; name = "King's Legguards"; col = TextColor.color(0xE2B560);
+                en.put(Enchantment.PROTECTION, 4); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability [/armour ability 3]: Royal Slam - launch up and slam down: 4 hearts true damage in 10 blocks (60s)",
+                        "Passive: no fall damage");
+            }
+            case "kings_step" -> {
+                mat = Material.NETHERITE_BOOTS; name = "King's Step"; col = TextColor.color(0xE2B560);
+                en.put(Enchantment.PROTECTION, 4); en.put(Enchantment.FEATHER_FALLING, 4); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability [/armour ability 4]: Royal Dash - dash 20 blocks, enemies you pass take 2 hearts true damage (20s)",
+                        "Passive: Speed III");
+            }
+            case "chrono_blade" -> {
+                mat = Material.NETHERITE_SWORD; name = "Chrono Blade"; col = TextColor.color(0xFFD75A);
+                en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.FIRE_ASPECT, 2); en.put(Enchantment.LOOTING, 3);
+                en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability 1 [F]: Time Warp - mark this spot; after 5s you are pulled back here with your old health (acts as a totem), 5 min",
+                        "Ability 2 [Shift+F]: Ageing Strike - Wither II + Poison II for 20s on the target (30s)");
+            }
+            case "soul_reaper" -> {
+                mat = Material.NETHERITE_AXE; name = "Soul Reaper"; col = TextColor.color(0xAA3CFF);
+                en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.SWEEPING_EDGE, 3); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability 1 [F]: Health Drain - steal 3 hearts from every player within 5 blocks for 20s (60s)",
+                        "Ability 2 [Shift+F]: Life Giver - Regeneration III for 10s + 1s of saturation");
+            }
+            case "dragons_rend" -> {
+                mat = Material.NETHERITE_SWORD; name = "Dragon's Rend"; col = TextColor.color(0xA050FF);
+                en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.FIRE_ASPECT, 2); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability 1 [F]: Void Slash - 40 wide, 30 long slash: 4 hearts true damage + rifts that hurt and curse (30s)",
+                        "Ability 2 [Shift+F]: Dragon's Domain - unbreakable black concrete sphere, End theme, dragon's breath floor, 1.25x damage (10s, 2 min)");
+            }
+            case "axe_of_abyss" -> {
+                mat = Material.NETHERITE_AXE; name = "Axe of the Abyss"; col = TextColor.color(0x8C32C8);
+                en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability 1 [F]: Abyssal Cleave - 25 block slash: 3 hearts true damage + Wither II 5s (30s)",
+                        "Ability 2 [Shift+F]: Unstable Power of the Void - 10s Strength II, Speed III, Resistance II, then 10s of weakness and +50% damage taken");
+            }
+            case "divine_executioner" -> {
+                mat = Material.NETHERITE_SWORD; name = "Divine Executioner"; col = TextColor.color(0xFFDC64);
+                en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability 1 [F]: Execution - a slash for 3 hearts true damage (30s)",
+                        "Ability 2 [Shift+F]: Judgement's Mark - Wither II + Slowness I and +25% damage from you for 20s (1 min)");
+            }
+            case "priests_staff" -> {
+                mat = Material.NETHERITE_AXE; name = "Priest's Staff"; col = TextColor.color(0xFFF0AA);
+                en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability 1 [F]: Inspire - you and trusted allies within 20 blocks get Speed III + Strength II for 20s (1 min)",
+                        "Ability 2 [Shift+F]: Sacrifice - offer ores to wear down nearby enemies' armor");
+            }
+            case "gamblers_sword" -> {
+                mat = Material.NETHERITE_SWORD; name = "Jackpot"; col = TextColor.color(0xE6283C);
+                en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.FIRE_ASPECT, 2); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Ability 1 [F]: Lucky Draw - three reels decide your luck (45s)",
+                        "Ability 2 [Shift+F]: Double or Nothing - 50/50, two Doubles in a row = JACKPOT (60s)",
+                        "Passive: House Edge - every 10th hit rolls a small bonus");
+            }
             default -> { return null; }
         }
         ItemStack item = new ItemStack(mat);
@@ -286,10 +395,17 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             meta.addAttributeModifier(Attribute.ATTACK_SPEED, new AttributeModifier(new NamespacedKey("dwarvenweapons", "trident_speed"),
                     -2.4, AttributeModifier.Operation.ADD_NUMBER, EquipmentSlotGroup.MAINHAND));   // 4.0 - 2.4 = 1.6, same as a sword
         }
-        if (id.equals("kings_crown")) {
-            EquippableComponent eq = meta.getEquippable();      // worn model: assets/dwarven/equipment/kings_crown.json
-            eq.setSlot(EquipmentSlot.HEAD);
-            eq.setModel(new NamespacedKey("dwarven", "kings_crown"));
+        EquipmentSlot wornSlot = switch (id) {
+            case "kings_crown" -> EquipmentSlot.HEAD;
+            case "kings_plate" -> EquipmentSlot.CHEST;
+            case "kings_legguards" -> EquipmentSlot.LEGS;
+            case "kings_step" -> EquipmentSlot.FEET;
+            default -> null;
+        };
+        if (wornSlot != null) {
+            EquippableComponent eq = meta.getEquippable();      // worn model: assets/dwarven/equipment/<id>.json
+            eq.setSlot(wornSlot);
+            eq.setModel(new NamespacedKey("dwarven", id));
             meta.setEquippable(eq);
         }
         meta.getPersistentDataContainer().set(KEY, PersistentDataType.STRING, id);
@@ -305,6 +421,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     public boolean onCommand(CommandSender s, Command c, String label, String[] a) {
         String cn = c.getName().toLowerCase(Locale.ROOT);
         if (cn.equals("trust") || cn.equals("untrust")) return handleTrust(s, cn, a);
+        if (cn.equals("armour")) return handleArmour(s, a);
         if (a.length == 0) { s.sendMessage("/dweapons <give|list|reload> [player] [weapon]"); return true; }
         switch (a[0].toLowerCase()) {
             case "list" -> s.sendMessage("Weapons: " + String.join(", ", IDS));
@@ -337,6 +454,11 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             if (cn.equals("trust") && a.length == 1) o.addAll(List.of("list", "remove"));
             if (a.length <= 2) Bukkit.getOnlinePlayers().forEach(pl -> o.add(pl.getName()));
             o.removeIf(x -> !x.toLowerCase(Locale.ROOT).startsWith(a[a.length - 1].toLowerCase(Locale.ROOT)));
+            return o;
+        }
+        if (cn.equals("armour")) {
+            List<String> o = new ArrayList<>();
+            if (a.length == 1) o.add("ability"); else if (a.length == 2) o.addAll(List.of("1", "2", "3", "4"));
             return o;
         }
         List<String> out = new ArrayList<>();
@@ -483,10 +605,18 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     void trueDamage(LivingEntity t, Player src, double amt) {
         if (t == null || t.isDead() || !t.isValid()) return;
         if (t instanceof Player pl && (pl.getGameMode() == GameMode.CREATIVE || pl.getGameMode() == GameMode.SPECTATOR)) return;
+        if (t instanceof Player tq) {
+            long now0 = System.currentTimeMillis();
+            Long dq = decree.get(tq.getUniqueId());
+            if (dq != null && dq > now0) amt *= 0.5;                 // Imperial Decree
+            Long wq = voidWeak.get(tq.getUniqueId());
+            if (wq != null && wq > now0) amt *= 1.5;                 // after the Void power fades
+        }
         internal = true;
         try { if (src != null) t.damage(0.01, src); else t.damage(0.01); } finally { internal = false; }
         double nh = t.getHealth() - amt;
         if (nh <= 0) {
+            if (t instanceof Player tw && warps.containsKey(tw.getUniqueId())) { rewind(tw, true); return; }   // Time Warp acts as a totem
             if (t instanceof Player tp && tryTotem(tp)) return;       // a totem saves them, like vanilla
             t.setHealth(0);
         } else t.setHealth(nh);
@@ -1207,6 +1337,13 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "sculk_battle_axe" -> new int[]{30, 200, 230};
             case "royal_spear", "divine_judgement" -> new int[]{255, 205, 60};
             case "temporal_reaver" -> new int[]{50, 230, 100};
+            case "chrono_blade" -> new int[]{255, 215, 90};
+            case "soul_reaper" -> new int[]{170, 60, 255};
+            case "dragons_rend" -> new int[]{150, 60, 255};
+            case "axe_of_abyss" -> new int[]{100, 35, 150};
+            case "divine_executioner" -> new int[]{255, 220, 100};
+            case "priests_staff" -> new int[]{255, 240, 170};
+            case "gamblers_sword" -> new int[]{230, 40, 60};
             default -> new int[]{255, 255, 255};
         };
     }
@@ -1218,7 +1355,10 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "hammer_of_the_void" -> Particle.REVERSE_PORTAL;
             case "inferno" -> Particle.FLAME;
             case "sculk_battle_axe" -> Particle.SCULK_SOUL;
-            case "royal_spear", "divine_judgement", "temporal_reaver" -> Particle.END_ROD;
+            case "soul_reaper" -> Particle.SOUL;
+            case "dragons_rend" -> Particle.REVERSE_PORTAL;
+            case "axe_of_abyss" -> Particle.PORTAL;
+            case "royal_spear", "divine_judgement", "temporal_reaver", "chrono_blade", "divine_executioner", "priests_staff" -> Particle.END_ROD;
             case "dwarven_pickaxe" -> Particle.ENCHANTED_HIT;
             default -> Particle.CRIT;
         };
@@ -1229,7 +1369,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         if (e.getAnimationType() != PlayerAnimationType.ARM_SWING) return;
         Player p = e.getPlayer();
         String id = id(p.getInventory().getItemInMainHand());
-        if (id == null || id.equals("kings_crown") || id.equals("primal_bow") || id.equals("mad_scientists_crossbow")) return;
+        if (id == null || id.startsWith("kings_") || id.equals("primal_bow") || id.equals("mad_scientists_crossbow")) return;
         int[] col = swingColor(id);
         Particle part = swingParticle(id);
         Location eye = p.getEyeLocation();
@@ -1252,11 +1392,975 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     public void onJoinLunge(PlayerJoinEvent e) { setLunge(e.getPlayer(), true); }
 
 
+
+    // ------------------------------------------------------------------ King's armour set (/armour ability 1-4)
+    boolean holdsShield(Player p) {
+        PlayerInventory i = p.getInventory();
+        return "kings_shield".equals(id(i.getItemInMainHand())) || "kings_shield".equals(id(i.getItemInOffHand()));
+    }
+
+    boolean handleArmour(CommandSender s, String[] a) {
+        if (!(s instanceof Player p)) { s.sendMessage("Players only."); return true; }
+        if (a.length < 2 || !a[0].equalsIgnoreCase("ability")) {
+            s.sendMessage("Usage: /armour ability <1-4>   (1 shield, 2 chestplate, 3 leggings, 4 boots)");
+            return true;
+        }
+        int n;
+        try { n = Integer.parseInt(a[1]); } catch (NumberFormatException ex) { s.sendMessage("Pick a number from 1 to 4."); return true; }
+        switch (n) {
+            case 1 -> imperialReprisal(p);
+            case 2 -> imperialDecree(p);
+            case 3 -> royalSlam(p);
+            case 4 -> royalDash(p);
+            default -> s.sendMessage("Pick a number from 1 to 4.");
+        }
+        return true;
+    }
+
+    void imperialReprisal(Player p) {
+        if (!holdsShield(p)) { msg(p, Component.text("Hold the King's Shield to use this", NamedTextColor.RED)); return; }
+        if (!cd(p, "imperial_reprisal", 30)) return;
+        reprisal.put(p.getUniqueId(), System.currentTimeMillis() + 15_000);
+        p.getWorld().playSound(p.getLocation(), Sound.ITEM_SHIELD_BLOCK, 1f, 0.6f);
+        auraTask(p, 300, l -> dustAt(l, 255, 205, 60, 1.2f, 1, 0.05));
+        msg(p, Component.text("IMPERIAL REPRISAL - block the next attack to reflect it", NamedTextColor.GOLD));
+    }
+
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onShieldReflect(EntityDamageByEntityEvent e) {
+        if (!(e.getEntity() instanceof Player p)) return;
+        Long armed = reprisal.get(p.getUniqueId());
+        if (armed == null || armed < System.currentTimeMillis()) return;
+        if (!p.isBlocking() || !holdsShield(p) || e.getFinalDamage() > 0.001) return;      // must be a fully blocked hit
+        Entity d = e.getDamager();
+        LivingEntity atk = null;
+        if (d instanceof LivingEntity dl) atk = dl;
+        else if (d instanceof Projectile pr && pr.getShooter() instanceof LivingEntity sl) atk = sl;
+        if (atk == null || atk == p || ally(p, atk)) return;
+        reprisal.remove(p.getUniqueId());
+        final LivingEntity target = atk;
+        Bukkit.getScheduler().runTask(this, () -> {
+            if (!target.isValid() || target.isDead()) return;
+            World w = target.getWorld(); Location tl = target.getLocation();
+            trueDamage(target, p, 6.0);
+            Vector kb = tl.toVector().subtract(p.getLocation().toVector()).setY(0);
+            if (kb.lengthSquared() < 1e-4) kb = p.getLocation().getDirection().setY(0);
+            kb.normalize().multiply(1.6).setY(0.45);
+            target.setVelocity(kb);
+            if (target instanceof Player tp) noKick(tp, 5000);
+            sp(w, Particle.EXPLOSION, tl.clone().add(0, 1, 0), 2, .3, .3, .3);
+            sp(w, Particle.END_ROD, tl.clone().add(0, 1, 0), 40, .5, .8, .5, 0.3);
+            expandRing(p.getLocation(), 4, 8, l -> dustAt(l, 255, 205, 60, 1.7f, 1, 0.05));
+            w.playSound(tl, Sound.ITEM_SHIELD_BREAK, 1f, 1.2f);
+            w.playSound(tl, Sound.BLOCK_ANVIL_LAND, 1f, 1.5f);
+            msg(p, Component.text("REPRISAL!", NamedTextColor.GOLD));
+        });
+    }
+
+    void imperialDecree(Player p) {
+        if (!"kings_plate".equals(id(p.getInventory().getChestplate()))) { msg(p, Component.text("Wear the King's Plate to use this", NamedTextColor.RED)); return; }
+        if (!cd(p, "imperial_decree", 30)) return;
+        decree.put(p.getUniqueId(), System.currentTimeMillis() + 5000);
+        AttributeInstance kbi = p.getAttribute(Attribute.KNOCKBACK_RESISTANCE);
+        AttributeModifier old = decreeMods.remove(p.getUniqueId());
+        if (kbi != null) {
+            if (old != null) kbi.removeModifier(old);
+            AttributeModifier mod = new AttributeModifier(new NamespacedKey("dwarvenweapons", "decree_kb"), 1.0, AttributeModifier.Operation.ADD_NUMBER);
+            try { kbi.addTransientModifier(mod); decreeMods.put(p.getUniqueId(), mod); } catch (IllegalArgumentException ignored) { }
+        }
+        World w = p.getWorld();
+        w.playSound(p.getLocation(), Sound.ITEM_TOTEM_USE, 0.6f, 1.4f);
+        w.playSound(p.getLocation(), Sound.BLOCK_BEACON_ACTIVATE, 1f, 1.2f);
+        expandRing(p.getLocation(), 4, 8, l -> { dustAt(l, 255, 205, 60, 1.8f, 1, 0.05); dustAt(l, 140, 20, 40, 1.4f, 1, 0.05); });
+        auraTask(p, 100, l -> { dustAt(l, 255, 205, 60, 1.4f, 1, 0.05); sp(w, Particle.END_ROD, l, 1, 0, 0, 0, 0.01); });
+        msg(p, Component.text("IMPERIAL DECREE - 50% less damage and no knockback for 5s", NamedTextColor.GOLD));
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            decree.remove(p.getUniqueId());
+            AttributeModifier m2 = decreeMods.remove(p.getUniqueId());
+            AttributeInstance k2 = p.getAttribute(Attribute.KNOCKBACK_RESISTANCE);
+            if (m2 != null && k2 != null) k2.removeModifier(m2);
+        }, 100L);
+    }
+
+    void royalSlam(Player p) {
+        if (!"kings_legguards".equals(id(p.getInventory().getLeggings()))) { msg(p, Component.text("Wear the King's Legguards to use this", NamedTextColor.RED)); return; }
+        if (!cd(p, "royal_slam", 60)) return;
+        World w = p.getWorld();
+        noKick(p, 12000);
+        p.setVelocity(new Vector(0, 1.6, 0));
+        w.playSound(p.getLocation(), Sound.ENTITY_ENDER_DRAGON_FLAP, 1f, 0.7f);
+        sp(w, Particle.EXPLOSION, p.getLocation(), 1);
+        new BukkitRunnable() {
+            int n = 0, slamTicks = 0;
+            boolean slamming = false;
+            @Override public void run() {
+                if (!p.isOnline() || p.isDead() || n++ > 140) { cancel(); return; }
+                Location b = p.getLocation();
+                if (!slamming) {
+                    dustAt(b, 255, 205, 60, 1.4f, 3, 0.3);
+                    sp(w, Particle.END_ROD, b, 2, .3, .1, .3, 0.01);
+                    if (n > 8 && p.getVelocity().getY() <= 0.05) {
+                        slamming = true;
+                        w.playSound(b, Sound.ENTITY_WITHER_SHOOT, 1f, 0.6f);
+                    }
+                } else {
+                    p.setVelocity(new Vector(0, -3.0, 0));
+                    slamTicks++;
+                    column(b, 6, l -> dustAt(l, 255, 205, 60, 1.4f, 1, 0.1));
+                    if (slamTicks > 2 && (p.isOnGround() || b.clone().subtract(0, 0.4, 0).getBlock().getType().isSolid())) {
+                        cancel();
+                        slamImpact(p);
+                    }
+                }
+            }
+        }.runTaskTimer(this, 0, 1);
+    }
+
+    void slamImpact(Player p) {
+        World w = p.getWorld(); Location c = p.getLocation();
+        for (Entity en : p.getNearbyEntities(10, 10, 10)) {
+            if (!(en instanceof LivingEntity le) || en instanceof ArmorStand || ally(p, en)) continue;
+            if (en.getLocation().distanceSquared(c) > 100) continue;
+            trueDamage(le, p, 8.0);
+            Vector away = en.getLocation().toVector().subtract(c.toVector()).setY(0);
+            if (away.lengthSquared() < 1e-4) away = new Vector(0, 0, 1);
+            away.normalize().multiply(0.9).setY(0.7);
+            le.setVelocity(away);
+            if (le instanceof Player kp) noKick(kp, 4000);
+        }
+        sp(w, Particle.EXPLOSION_EMITTER, c, 2, 1, 0.5, 1);
+        sp(w, Particle.EXPLOSION, c.clone().add(0, 0.5, 0), 6, 3, .3, 3);
+        expandRing(c, 10, 12, l -> { dustAt(l, 255, 205, 60, 2f, 1, 0.05); sp(w, Particle.CLOUD, l, 2, .3, .2, .3, 0.05); sp(w, Particle.FLAME, l, 1, .1, .1, .1, 0.02); });
+        column(c, 8, l -> sp(w, Particle.END_ROD, l, 3, .8, .1, .8, 0.05));
+        sp(w, Particle.BLOCK, c, 80, 2, .3, 2, 0, c.clone().subtract(0, 1, 0).getBlock().getBlockData());
+        w.strikeLightningEffect(c);
+        w.playSound(c, Sound.ENTITY_GENERIC_EXPLODE, 1.5f, 0.7f);
+        w.playSound(c, Sound.BLOCK_ANVIL_LAND, 1f, 0.5f);
+        msg(p, Component.text("ROYAL SLAM", NamedTextColor.GOLD));
+    }
+
+    void royalDash(Player p) {
+        if (!"kings_step".equals(id(p.getInventory().getBoots()))) { msg(p, Component.text("Wear the King's Step to use this", NamedTextColor.RED)); return; }
+        if (!cd(p, "royal_dash", 20)) return;
+        Vector dir = p.getLocation().getDirection().normalize();
+        Location cur = p.getLocation().clone();
+        World w = p.getWorld();
+        Set<UUID> hit = new HashSet<>();
+        noKick(p, 6000);
+        w.playSound(cur, Sound.ENTITY_ENDER_DRAGON_FLAP, 1f, 1.4f);
+        w.playSound(cur, Sound.ITEM_TRIDENT_RIPTIDE_3, 1f, 1.2f);
+        new BukkitRunnable() {
+            int tick = 0;
+            @Override public void run() {
+                if (!p.isOnline() || tick++ >= 5) { cancel(); return; }
+                boolean blocked = false;
+                for (int st = 0; st < 8; st++) {                  // 8 x 0.5 = 4 blocks per tick -> 20 blocks in 5 ticks
+                    Location next = cur.clone().add(dir.clone().multiply(0.5));
+                    if (next.getBlock().getType().isSolid() || next.clone().add(0, 1, 0).getBlock().getType().isSolid()) { blocked = true; break; }
+                    cur.setX(next.getX()); cur.setY(next.getY()); cur.setZ(next.getZ());
+                    for (Entity en : w.getNearbyEntities(cur, 1.3, 1.3, 1.3)) {
+                        if (en == p || !(en instanceof LivingEntity le) || en instanceof ArmorStand || ally(p, en)) continue;
+                        if (hit.add(en.getUniqueId())) {
+                            trueDamage(le, p, 4.0);
+                            sp(w, Particle.CRIT, le.getLocation().add(0, 1, 0), 30, .4, .6, .4, 0.5);
+                            sp(w, Particle.END_ROD, le.getLocation().add(0, 1, 0), 15, .3, .5, .3, 0.2);
+                            w.playSound(le.getLocation(), Sound.ENTITY_PLAYER_ATTACK_SWEEP, 1f, 1f);
+                        }
+                    }
+                    dustAt(cur.clone().add(0, 1, 0), 255, 205, 60, 1.5f, 2, 0.2);
+                    if (st % 2 == 0) sp(w, Particle.END_ROD, cur.clone().add(0, 1, 0), 1, .1, .3, .1, 0.01);
+                }
+                Location dest = cur.clone();
+                dest.setYaw(p.getLocation().getYaw()); dest.setPitch(p.getLocation().getPitch());
+                p.teleport(dest);
+                if (blocked) cancel();
+            }
+        }.runTaskTimer(this, 0, 1);
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onPlayerHurt(EntityDamageEvent e) {
+        if (!(e.getEntity() instanceof Player p)) return;
+        if (e.getCause() == EntityDamageEvent.DamageCause.FALL && "kings_legguards".equals(id(p.getInventory().getLeggings()))) {
+            e.setCancelled(true);                                       // King's Legguards: no fall damage
+            return;
+        }
+        long now = System.currentTimeMillis();
+        Long d = decree.get(p.getUniqueId());
+        if (d != null && d > now) e.setDamage(e.getDamage() * 0.5);
+        Long w = voidWeak.get(p.getUniqueId());
+        if (w != null && w > now) e.setDamage(e.getDamage() * 1.5);
+        if (warps.containsKey(p.getUniqueId()) && p.getHealth() - e.getFinalDamage() <= 0) {   // Time Warp acts as a totem
+            e.setCancelled(true);
+            rewind(p, true);
+        }
+    }
+
+    @EventHandler
+    public void onQuitCleanup(PlayerQuitEvent e) { warps.remove(e.getPlayer().getUniqueId()); }
+
+    void armourHud(Player p) {
+        if (!getConfig().getBoolean("cooldown-hud", true)) return;
+        Long hold = holdUntil.get(p.getUniqueId());
+        if (hold != null && hold > System.currentTimeMillis()) return;
+        PlayerInventory inv = p.getInventory();
+        List<String[]> parts = new ArrayList<>();
+        if (holdsShield(p)) parts.add(new String[]{"/armour 1 Reprisal", "imperial_reprisal"});
+        if ("kings_plate".equals(id(inv.getChestplate()))) parts.add(new String[]{"/armour 2 Decree", "imperial_decree"});
+        if ("kings_legguards".equals(id(inv.getLeggings()))) parts.add(new String[]{"/armour 3 Slam", "royal_slam"});
+        if ("kings_step".equals(id(inv.getBoots()))) parts.add(new String[]{"/armour 4 Dash", "royal_dash"});
+        if (parts.isEmpty()) return;
+        Component c = Component.empty();
+        for (int i = 0; i < parts.size(); i++) {
+            if (i > 0) c = c.append(Component.text("  |  ", NamedTextColor.DARK_GRAY));
+            long rem = remaining(p, parts.get(i)[1]);
+            c = c.append(rem > 0 ? Component.text(parts.get(i)[0] + " " + rem + "s", NamedTextColor.RED)
+                                 : Component.text(parts.get(i)[0] + " READY", NamedTextColor.GREEN));
+        }
+        p.sendActionBar(c);
+    }
+
+    // ------------------------------------------------------------------ Chrono Blade
+    void timeWarp(Player p) {
+        if (warps.containsKey(p.getUniqueId())) return;
+        if (!cd(p, "time_warp", 300)) return;
+        WarpState ws = new WarpState();
+        ws.loc = p.getLocation().clone(); ws.health = p.getHealth(); ws.food = p.getFoodLevel();
+        warps.put(p.getUniqueId(), ws);
+        noKick(p, 8000);
+        World w = p.getWorld(); Location mark = ws.loc.clone();
+        w.playSound(mark, Sound.BLOCK_BEACON_ACTIVATE, 1f, 1.4f);
+        msg(p, Component.text("TIME WARP - this moment is marked. Returning in 5 seconds...", NamedTextColor.GOLD));
+        new BukkitRunnable() {
+            int n = 0;
+            @Override public void run() {
+                if (warps.get(p.getUniqueId()) != ws) { cancel(); return; }
+                if (!p.isOnline()) { warps.remove(p.getUniqueId()); cancel(); return; }
+                for (int i = 0; i < 28; i++) {
+                    double a = i * Math.PI * 2 / 28 + n * 0.15;
+                    dustAt(mark.clone().add(Math.cos(a) * 1.3, 0.1, Math.sin(a) * 1.3), 255, 210, 80, 1.2f, 1, 0.02);
+                    dustAt(mark.clone().add(Math.cos(a) * 0.7, 0.1 + n * 0.02, Math.sin(a) * 0.7), 70, 110, 255, 1.0f, 1, 0.02);
+                }
+                column(mark, 3, l -> sp(w, Particle.END_ROD, l, 1, 0.1, 0, 0.1, 0.005));
+                if (n % 10 == 0) w.playSound(mark, Sound.BLOCK_NOTE_BLOCK_CHIME, 1f, 0.6f + n / 40f);
+                if (++n * 2 >= 100) { cancel(); rewind(p, false); }
+            }
+        }.runTaskTimer(this, 0, 2);
+    }
+
+    void rewind(Player p, boolean saved) {
+        WarpState ws = warps.remove(p.getUniqueId());
+        if (ws == null) return;
+        World w = p.getWorld();
+        Location from = p.getLocation().clone();
+        beam(from.clone().add(0, 1, 0), ws.loc.clone().add(0, 1, 0), 0.5, l -> dustAt(l, 255, 210, 80, 1.2f, 1, 0.05));
+        sp(w, Particle.PORTAL, from.clone().add(0, 1, 0), 60, .4, .8, .4, 0.8);
+        noKick(p, 6000);
+        p.teleport(ws.loc);
+        AttributeInstance mh = p.getAttribute(Attribute.MAX_HEALTH);
+        double max = mh != null ? mh.getValue() : 20.0;
+        p.setHealth(Math.max(1.0, Math.min(max, ws.health)));
+        p.setFoodLevel(ws.food); p.setFireTicks(0); p.setFallDistance(0f);
+        World w2 = p.getWorld();
+        sp(w2, Particle.TOTEM_OF_UNDYING, ws.loc.clone().add(0, 1, 0), saved ? 80 : 40, .5, 1, .5, 0.4);
+        expandRing(ws.loc, 4, 8, l -> dustAt(l, 255, 210, 80, 1.6f, 1, 0.05));
+        w2.playSound(ws.loc, saved ? Sound.ITEM_TOTEM_USE : Sound.ENTITY_ENDERMAN_TELEPORT, 1f, 1f);
+        msg(p, Component.text(saved ? "TIME WARP saved you from death!" : "Time rewound.", NamedTextColor.GOLD));
+    }
+
+    void ageingStrike(Player p) {
+        LivingEntity t = meleeTarget(p);
+        if (t == null) { msg(p, Component.text("No target in reach", NamedTextColor.GRAY)); return; }
+        if (!cd(p, "ageing_strike", 30)) return;
+        t.addPotionEffect(new PotionEffect(PotionEffectType.WITHER, 400, 1));
+        t.addPotionEffect(new PotionEffect(PotionEffectType.POISON, 400, 1));
+        World w = t.getWorld(); Location b = t.getLocation();
+        w.playSound(b, Sound.BLOCK_BEACON_DEACTIVATE, 1f, 0.6f);
+        w.playSound(b, Sound.ENTITY_WITHER_HURT, 0.8f, 0.7f);
+        expandRing(b, 3, 8, l -> { dustAt(l, 170, 170, 150, 1.6f, 1, 0.05); dustAt(l, 255, 215, 90, 1.3f, 1, 0.05); });
+        sp(w, Particle.SMOKE, b.clone().add(0, 1, 0), 40, .4, .8, .4, 0.05);
+        sp(w, Particle.END_ROD, b.clone().add(0, 1, 0), 25, .4, .8, .4, 0.1);
+        new BukkitRunnable() {          // an hourglass of grey sand falls over the aged target
+            int n = 0;
+            @Override public void run() {
+                if (!t.isValid() || n++ >= 20) { cancel(); return; }
+                Location head = t.getEyeLocation().add(0, 0.6, 0);
+                dustAt(head, 170, 170, 150, 1.3f, 4, 0.3);
+                dustAt(head.clone().add(0, -0.5, 0), 255, 215, 90, 1.0f, 2, 0.15);
+            }
+        }.runTaskTimer(this, 0, 5);
+    }
+
+    // ------------------------------------------------------------------ Soul Reaper
+    void healthDrain(Player p) {
+        List<Player> victims = new ArrayList<>();
+        for (Entity en : p.getNearbyEntities(5, 5, 5)) {
+            if (en instanceof Player v && !ally(p, v) && v.getGameMode() != GameMode.CREATIVE && v.getGameMode() != GameMode.SPECTATOR
+                    && v.getLocation().distanceSquared(p.getLocation()) <= 25) victims.add(v);
+        }
+        if (victims.isEmpty()) { msg(p, Component.text("No players within 5 blocks", NamedTextColor.GRAY)); return; }
+        if (!cd(p, "health_drain", 60)) return;
+        World w = p.getWorld();
+        Map<Player, AttributeModifier> taken = new HashMap<>();
+        double gain = 0;
+        for (Player v : victims) {
+            AttributeInstance vi = v.getAttribute(Attribute.MAX_HEALTH);
+            if (vi == null) continue;
+            AttributeModifier mod = new AttributeModifier(new NamespacedKey("dwarvenweapons",
+                    "drain_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12)), -6.0, AttributeModifier.Operation.ADD_NUMBER);
+            vi.addTransientModifier(mod);
+            taken.put(v, mod);
+            gain += 6.0;
+            beam(v.getLocation().add(0, 1, 0), p.getLocation().add(0, 1, 0), 0.4, l -> { dustAt(l, 170, 60, 255, 1.4f, 1, 0.05); sp(w, Particle.SOUL, l, 1, 0, 0, 0, 0.01); });
+            sp(w, Particle.SOUL, v.getLocation().add(0, 1, 0), 20, .4, .7, .4, 0.05);
+        }
+        gain = Math.min(gain, getConfig().getDouble("health-drain-max-gain", 20.0));
+        AttributeInstance pi = p.getAttribute(Attribute.MAX_HEALTH);
+        AttributeModifier mine = null;
+        if (pi != null && gain > 0) {
+            mine = new AttributeModifier(new NamespacedKey("dwarvenweapons",
+                    "drain_self_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12)), gain, AttributeModifier.Operation.ADD_NUMBER);
+            pi.addTransientModifier(mine);
+            p.setHealth(Math.min(pi.getValue(), p.getHealth() + gain));
+        }
+        final AttributeModifier fmine = mine;
+        expandRing(p.getLocation(), 5, 8, l -> dustAt(l, 170, 60, 255, 1.6f, 1, 0.05));
+        w.playSound(p.getLocation(), Sound.ENTITY_WITHER_AMBIENT, 1f, 0.6f);
+        msg(p, Component.text("HEALTH DRAIN - hearts stolen for 20 seconds", NamedTextColor.DARK_PURPLE));
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            for (Map.Entry<Player, AttributeModifier> en : taken.entrySet()) {
+                Player vv = en.getKey();
+                AttributeInstance vi2 = vv.getAttribute(Attribute.MAX_HEALTH);
+                if (vi2 != null) {
+                    vi2.removeModifier(en.getValue());
+                    if (!vv.isDead()) vv.setHealth(Math.min(vi2.getValue(), vv.getHealth() + 6.0));   // their hearts are returned
+                }
+            }
+            if (fmine != null) { AttributeInstance pi2 = p.getAttribute(Attribute.MAX_HEALTH); if (pi2 != null) pi2.removeModifier(fmine); }
+        }, 400L);
+    }
+
+    void lifeGiver(Player p) {
+        if (!cd(p, "life_giver", 30)) return;
+        p.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, 200, 2));
+        p.addPotionEffect(new PotionEffect(PotionEffectType.SATURATION, 20, 0));
+        World w = p.getWorld();
+        w.playSound(p.getLocation(), Sound.ENTITY_ZOMBIE_VILLAGER_CURE, 1f, 1.2f);
+        auraTask(p, 200, l -> { dustAt(l, 90, 255, 120, 1.3f, 1, 0.05); sp(w, Particle.SOUL, l, 1, 0, 0, 0, 0.02); });
+        expandRing(p.getLocation(), 3, 8, l -> sp(w, Particle.HAPPY_VILLAGER, l, 2, .2, .3, .2));
+        msg(p, Component.text("LIFE GIVER", NamedTextColor.GREEN));
+    }
+
+    // ------------------------------------------------------------------ Dragon's Rend
+    void voidSlash(Player p) {
+        if (!cd(p, "void_slash", 30)) return;
+        World w = p.getWorld(); Location o = p.getLocation().clone();
+        Vector fd = p.getLocation().getDirection().setY(0);
+        if (fd.lengthSquared() < 1e-4) fd = new Vector(0, 0, 1);
+        fd.normalize();
+        final Vector fwd = fd.clone();
+        final Vector side = new Vector(-fwd.getZ(), 0, fwd.getX());
+        Set<UUID> hit = new HashSet<>();
+        w.playSound(o, Sound.ENTITY_ENDER_DRAGON_GROWL, 1.2f, 0.7f);
+        long riftEnd = System.currentTimeMillis() + getConfig().getInt("rift-lifetime-seconds", 30) * 1000L;
+        for (int i = 0; i < 28; i++) {                          // unstable rifts scattered through the slash
+            double lat = (rng.nextDouble() * 2 - 1) * 19, dist = 3 + rng.nextDouble() * 26.5;
+            double bow = (lat * lat) / 80.0;
+            Rift r = new Rift(); r.owner = p.getUniqueId(); r.end = riftEnd;
+            r.loc = o.clone().add(fwd.clone().multiply(Math.max(1, dist - bow))).add(side.clone().multiply(lat)).add(0, 0.6 + rng.nextDouble() * 1.6, 0);
+            rifts.add(r);
+        }
+        new BukkitRunnable() {
+            int step = 0;
+            @Override public void run() {
+                double d0 = step * 2.0;
+                for (double lat = -20; lat <= 20; lat += 0.7) {
+                    double bow = (lat * lat) / 80.0;
+                    Location pt = o.clone().add(fwd.clone().multiply(d0 + 2.0 - bow)).add(side.clone().multiply(lat)).add(0, 1, 0);
+                    dustAt(pt, 150, 60, 255, 1.9f, 1, 0.1);
+                    sp(w, Particle.REVERSE_PORTAL, pt, 1, 0.1, 0.5, 0.1, 0.05);
+                    if (((int) (lat * 10)) % 4 == 0) sp(w, Particle.DRAGON_BREATH, pt.clone().add(0, 0.5, 0), 1, 0.1, 0.1, 0.1, 0.01);
+                }
+                for (Entity en : w.getNearbyEntities(o.clone().add(fwd.clone().multiply(d0 + 1)), 23, 6, 23)) {
+                    if (!(en instanceof LivingEntity le) || en == p || en instanceof ArmorStand || ally(p, en)) continue;
+                    if (hit.contains(en.getUniqueId())) continue;
+                    Vector rel = en.getLocation().toVector().subtract(o.toVector());
+                    double f = rel.dot(fwd), lt = rel.dot(side), bw = (lt * lt) / 80.0;
+                    if (Math.abs(lt) > 20 || f < d0 - bw || f > d0 + 2.0 - bw) continue;
+                    hit.add(en.getUniqueId());
+                    trueDamage(le, p, 8.0);
+                    sp(w, Particle.REVERSE_PORTAL, le.getLocation().add(0, 1, 0), 40, .4, .8, .4, 0.5);
+                    if (le instanceof Player kp) noKick(kp, 3000);
+                }
+                if (++step >= 15) cancel();
+            }
+        }.runTaskTimer(this, 0, 1);
+    }
+
+    void tickRifts() {
+        long now = System.currentTimeMillis();
+        Iterator<Rift> it = rifts.iterator();
+        while (it.hasNext()) {
+            Rift r = it.next();
+            if (r.end < now || r.loc.getWorld() == null) { it.remove(); continue; }
+            World w = r.loc.getWorld();
+            sp(w, Particle.PORTAL, r.loc, 6, .35, .5, .35, 0.4);
+            dustAt(r.loc, 150, 60, 255, 1.4f, 2, 0.3);
+            sp(w, Particle.END_ROD, r.loc, 1, .3, .5, .3, 0.01);
+            for (Entity en : w.getNearbyEntities(r.loc, 1.4, 1.6, 1.4)) {
+                if (!(en instanceof Player v) || v.getUniqueId().equals(r.owner)) continue;
+                Player owner = Bukkit.getPlayer(r.owner);
+                if (owner != null && ally(owner, v)) continue;
+                if (v.getGameMode() == GameMode.CREATIVE || v.getGameMode() == GameMode.SPECTATOR) continue;
+                it.remove();
+                trueDamage(v, owner, 2.0);
+                PotionEffectType[] neg = {PotionEffectType.SLOWNESS, PotionEffectType.WEAKNESS, PotionEffectType.BLINDNESS, PotionEffectType.NAUSEA,
+                        PotionEffectType.HUNGER, PotionEffectType.MINING_FATIGUE, PotionEffectType.WITHER, PotionEffectType.POISON, PotionEffectType.DARKNESS};
+                v.addPotionEffect(new PotionEffect(neg[rng.nextInt(neg.length)], 400, 0));
+                sp(w, Particle.REVERSE_PORTAL, r.loc, 50, .4, .6, .4, 0.6);
+                sp(w, Particle.DRAGON_BREATH, r.loc, 20, .3, .4, .3, 0.05);
+                w.playSound(r.loc, Sound.ENTITY_ENDERMAN_TELEPORT, 1f, 0.5f);
+                break;
+            }
+        }
+    }
+
+    List<Block> sphereShell(Location c, int R) {
+        World w = c.getWorld();
+        List<Block> out = new ArrayList<>();
+        for (int x = -R - 1; x <= R + 1; x++) for (int y = -R - 1; y <= R + 1; y++) for (int z = -R - 1; z <= R + 1; z++) {
+            double d = Math.sqrt(x * x + y * y + z * z);
+            if (d < R - 0.5 || d >= R + 0.5) continue;
+            int by = c.getBlockY() + y, bx = c.getBlockX() + x, bz = c.getBlockZ() + z;
+            if (by < w.getMinHeight() || by >= w.getMaxHeight() || !w.isChunkLoaded(bx >> 4, bz >> 4)) continue;
+            Block b = w.getBlockAt(bx, by, bz);
+            if (domeReplaceable(b)) out.add(b);
+        }
+        out.sort(Comparator.comparingInt(Block::getY));
+        return out;
+    }
+
+    Material endOf(Material m, Random rnd) {
+        String n = m.name();
+        if (n.contains("END_") || n.contains("PURPUR") || n.equals("OBSIDIAN") || n.equals("BLACK_CONCRETE") || n.equals("BEDROCK")
+                || n.contains("PORTAL") || n.contains("CHORUS")) return null;
+        switch (m) {
+            case WATER, BUBBLE_COLUMN, KELP, KELP_PLANT, SEAGRASS, TALL_SEAGRASS, SHORT_GRASS, TALL_GRASS, FERN, LARGE_FERN,
+                 DEAD_BUSH, SNOW, VINE, SUGAR_CANE -> { return Material.AIR; }
+            default -> { }
+        }
+        if (n.endsWith("_LOG") || n.endsWith("_WOOD") || n.endsWith("_PLANKS")) return Material.PURPUR_BLOCK;
+        if (n.endsWith("_LEAVES")) return Material.END_STONE_BRICKS;
+        if (m.isBlock() && m.isSolid() && m.isOccluding()) {
+            int r = rnd.nextInt(100);
+            return r < 8 ? Material.OBSIDIAN : (r < 18 ? Material.END_STONE_BRICKS : Material.END_STONE);
+        }
+        return null;
+    }
+
+    void endify(Location c, int R, World w, List<Block> changed) {
+        Random rnd = new Random();
+        for (int x = -R; x <= R; x++) for (int dy = -R; dy <= R; dy++) for (int dz = -R; dz <= R; dz++) {
+            if (x * x + dy * dy + dz * dz > R * R) continue;
+            int bx = c.getBlockX() + x, by = c.getBlockY() + dy, bz = c.getBlockZ() + dz;
+            if (by < w.getMinHeight() || by >= w.getMaxHeight() || !w.isChunkLoaded(bx >> 4, bz >> 4)) continue;
+            Block b = w.getBlockAt(bx, by, bz);
+            Material t = b.getType();
+            if (t.isAir() || dome.containsKey(b) || incinOrig.containsKey(b)) continue;
+            if (t != Material.WATER && b.getBlockData() instanceof Waterlogged wl && wl.isWaterlogged()) {
+                incinOrig.put(b, b.getBlockData()); incinSet.put(b, t); changed.add(b);
+                wl.setWaterlogged(false); b.setBlockData(wl, false);
+                continue;
+            }
+            Material to = endOf(t, rnd);
+            if (to == null) continue;
+            if (!to.isAir() && b.getState(false) instanceof TileState) continue;
+            incinOrig.put(b, b.getBlockData()); incinSet.put(b, to); changed.add(b);
+            b.setType(to, false);
+        }
+    }
+
+    boolean domainBlocks(Player enemy) {
+        long now = System.currentTimeMillis();
+        for (Map.Entry<UUID, Domain> en : domains.entrySet()) {
+            Domain d = en.getValue();
+            if (d.end() < now || en.getKey().equals(enemy.getUniqueId())) continue;
+            if (!d.center().getWorld().equals(enemy.getWorld())
+                    || d.center().distanceSquared(enemy.getLocation()) > (double) d.radius() * d.radius()) continue;
+            Player owner = Bukkit.getPlayer(en.getKey());
+            if (owner != null && ally(owner, enemy)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    boolean inDomain(Location l) {
+        long now = System.currentTimeMillis();
+        for (Domain d : domains.values()) {
+            if (d.end() < now || !d.center().getWorld().equals(l.getWorld())) continue;
+            if (d.center().distanceSquared(l) <= (double) d.radius() * d.radius()) return true;
+        }
+        return false;
+    }
+
+    void dragonsDomain(Player p) {
+        if (!cd(p, "dragons_domain", 120)) return;
+        int R = 5;
+        World w = p.getWorld(); Location c = p.getLocation().clone();
+        domains.put(p.getUniqueId(), new Domain(c, R, System.currentTimeMillis() + 10_000));
+        List<Block> shell = sphereShell(c, R);
+        for (Block b : shell) {
+            domeOrig.put(b, b.getBlockData());
+            b.setType(Material.BLACK_CONCRETE, false);
+            dome.put(b, Material.AIR);                          // unbreakable
+        }
+        Bukkit.getScheduler().runTaskLater(this, () -> restoreDome(shell), 200L);
+        List<Block> changed = new ArrayList<>();
+        endify(c, R - 1, w, changed);                           // everything inside turns End themed
+        Bukkit.getScheduler().runTaskLater(this, () -> revertNether(changed), 200L);
+        w.playSound(c, Sound.ENTITY_ENDER_DRAGON_GROWL, 1.2f, 0.8f);
+        w.playSound(c, Sound.BLOCK_END_PORTAL_SPAWN, 0.8f, 1.2f);
+        expandRing(c, R + 2, 10, l -> { dustAt(l, 30, 15, 45, 2f, 1, 0.05); sp(w, Particle.DRAGON_BREATH, l, 1, .1, .2, .1, .01); });
+        msg(p, Component.text("DRAGON'S DOMAIN", NamedTextColor.DARK_PURPLE));
+        double dmg = getConfig().getDouble("domain-breath-damage", 1.0);
+        new BukkitRunnable() {
+            int n = 0;
+            @Override public void run() {
+                if (n++ >= 20) { cancel(); return; }                // 20 x 10 ticks = 10 seconds
+                for (double fx = -R; fx <= R; fx += 0.9) for (double fz = -R; fz <= R; fz += 0.9) {
+                    if (fx * fx + fz * fz > (R - 0.5) * (R - 0.5)) continue;
+                    sp(w, Particle.DRAGON_BREATH, c.clone().add(fx, 0.15, fz), 1, 0.1, 0.05, 0.1, 0.01);
+                }
+                for (Entity en : w.getNearbyEntities(c, R, R, R)) {
+                    if (en == p || !(en instanceof LivingEntity le) || en instanceof ArmorStand || ally(p, en)) continue;
+                    if (le.getLocation().distanceSquared(c) > (double) R * R) continue;
+                    trueDamage(le, p, dmg);                         // dragon's breath floor
+                    sp(w, Particle.DRAGON_BREATH, le.getLocation().add(0, 0.3, 0), 4, .3, .2, .3, 0.02);
+                }
+                for (int k = 0; k < 12 && !shell.isEmpty(); k++) {
+                    Block sb = shell.get(rng.nextInt(shell.size()));
+                    dustAt(sb.getLocation().add(0.5, 0.5, 0.5), 150, 60, 255, 1.3f, 1, 0.3);
+                }
+            }
+        }.runTaskTimer(this, 0, 10);
+    }
+
+    // ------------------------------------------------------------------ Axe of the Abyss
+    void abyssalCleave(Player p) {
+        if (!cd(p, "abyssal_cleave", 30)) return;
+        World w = p.getWorld();
+        Vector dir = p.getLocation().getDirection().normalize();
+        Location start = p.getLocation().add(0, 1, 0);
+        Vector side = dir.clone().crossProduct(new Vector(0, 1, 0));
+        if (side.lengthSquared() < 1e-4) side = new Vector(1, 0, 0);
+        side.normalize();
+        final Vector fside = side;
+        w.playSound(start, Sound.ENTITY_WITHER_SHOOT, 1f, 0.5f);
+        w.playSound(start, Sound.ENTITY_GENERIC_EXPLODE, 0.8f, 0.5f);
+        for (Entity en : w.getNearbyEntities(start.clone().add(dir.clone().multiply(12.5)), 14, 14, 14)) {
+            if (en == p || !(en instanceof LivingEntity le) || en instanceof ArmorStand || ally(p, en)) continue;
+            BoundingBox box = en.getBoundingBox().expand(1.5);
+            if (box.rayTrace(start.toVector(), dir, 25) == null) continue;
+            trueDamage(le, p, 6.0);
+            le.addPotionEffect(new PotionEffect(PotionEffectType.WITHER, 100, 1));
+            sp(w, Particle.SMOKE, le.getLocation().add(0, 1, 0), 40, .4, .8, .4, 0.08);
+            sp(w, Particle.PORTAL, le.getLocation().add(0, 1, 0), 40, .4, .8, .4, 0.8);
+        }
+        new BukkitRunnable() {                                  // the slash races down the line
+            int n = 0;
+            @Override public void run() {
+                if (n >= 6) { cancel(); return; }
+                double d0 = n * 25.0 / 6, d1 = (n + 1) * 25.0 / 6;
+                for (double d = d0; d < d1; d += 0.5) {
+                    for (double off = -2.2; off <= 2.2; off += 0.4) {
+                        Location pt = start.clone().add(dir.clone().multiply(d)).add(fside.clone().multiply(off)).add(0, Math.abs(off) * 0.25, 0);
+                        dustAt(pt, 60, 20, 90, 1.9f, 1, 0.05);
+                        if (((int) (off * 10)) % 8 == 0) sp(w, Particle.PORTAL, pt, 2, .1, .1, .1, 0.4);
+                    }
+                    sp(w, Particle.SMOKE, start.clone().add(dir.clone().multiply(d)), 2, .3, .3, .3, 0.02);
+                }
+                n++;
+            }
+        }.runTaskTimer(this, 0, 1);
+    }
+
+    void voidPower(Player p) {
+        if (!cd(p, "void_power", 90)) return;
+        World w = p.getWorld();
+        p.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, 200, 1));
+        p.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 200, 2));
+        p.addPotionEffect(new PotionEffect(PotionEffectType.RESISTANCE, 200, 1));
+        w.strikeLightningEffect(p.getLocation());
+        w.playSound(p.getLocation(), Sound.ENTITY_ENDER_DRAGON_GROWL, 1f, 0.5f);
+        expandRing(p.getLocation(), 8, 12, l -> { dustAt(l, 90, 25, 130, 2f, 1, 0.05); sp(w, Particle.PORTAL, l, 3, .2, .6, .2, 0.5); });
+        auraTask(p, 200, l -> { dustAt(l, 100, 35, 150, 1.6f, 2, 0.1); sp(w, Particle.SMOKE, l, 1, .1, .1, .1, 0.02); });
+        msg(p, Component.text("THE VOID EMPOWERS YOU", NamedTextColor.DARK_PURPLE));
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (!p.isOnline()) return;
+            p.addPotionEffect(new PotionEffect(PotionEffectType.WITHER, 200, 1));
+            p.addPotionEffect(new PotionEffect(PotionEffectType.WEAKNESS, 200, 0));
+            p.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 200, 0));
+            voidWeak.put(p.getUniqueId(), System.currentTimeMillis() + 10_000);      // +50% damage taken
+            sp(w, Particle.SMOKE, p.getLocation().add(0, 1, 0), 60, .5, 1, .5, 0.05);
+            msg(p, Component.text("The void leaves you weakened...", NamedTextColor.GRAY));
+        }, 200L);
+    }
+
+    // ------------------------------------------------------------------ Divine Executioner
+    void execution(Player p) {
+        if (!cd(p, "execution", 30)) return;
+        World w = p.getWorld(); Location base = p.getLocation().add(0, 1, 0);
+        Vector dir = p.getLocation().getDirection().setY(0);
+        if (dir.lengthSquared() < 1e-4) dir = new Vector(0, 0, 1);
+        dir.normalize();
+        Vector side = new Vector(-dir.getZ(), 0, dir.getX());
+        for (double ang = -1.2; ang <= 1.2; ang += 0.07) {
+            Vector off = dir.clone().multiply(Math.cos(ang) * 5).add(side.clone().multiply(Math.sin(ang) * 5));
+            Location pt = base.clone().add(off);
+            dustAt(pt, 255, 215, 90, 2f, 2, 0.1);
+            sp(w, Particle.END_ROD, pt, 1, .05, .3, .05, 0.02);
+        }
+        w.playSound(base, Sound.ENTITY_PLAYER_ATTACK_SWEEP, 1.2f, 0.6f);
+        w.playSound(base, Sound.ITEM_TRIDENT_THUNDER, 0.8f, 1.5f);
+        for (Entity en : p.getNearbyEntities(6.5, 4, 6.5)) {
+            if (en == p || !(en instanceof LivingEntity le) || en instanceof ArmorStand || ally(p, en)) continue;
+            Vector rel = en.getLocation().toVector().subtract(p.getLocation().toVector()).setY(0);
+            double d = rel.length();
+            if (d > 6.5 || (d > 0.01 && rel.clone().normalize().dot(dir) < 0.4)) continue;
+            trueDamage(le, p, 6.0);
+            sp(w, Particle.END_ROD, le.getLocation().add(0, 1, 0), 40, .4, .7, .4, 0.3);
+            sp(w, Particle.TOTEM_OF_UNDYING, le.getLocation().add(0, 1, 0), 25, .4, .7, .4, 0.3);
+            w.strikeLightningEffect(le.getLocation());
+        }
+    }
+
+    void judgementsMark(Player p) {
+        LivingEntity t = lookTarget(p, 30);
+        if (t == null) { msg(p, Component.text("No target in sight", NamedTextColor.GRAY)); return; }
+        if (!cd(p, "judgements_mark", 60)) return;
+        t.addPotionEffect(new PotionEffect(PotionEffectType.WITHER, 400, 1));
+        t.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 400, 0));
+        marks.put(t.getUniqueId(), new Mark(p.getUniqueId(), System.currentTimeMillis() + 20_000, 0.25));
+        World w = t.getWorld();
+        w.playSound(t.getLocation(), Sound.BLOCK_BEACON_POWER_SELECT, 1f, 1.4f);
+        beam(t.getLocation().add(0, 20, 0), t.getLocation(), 0.4, l -> { dustAt(l, 255, 220, 100, 1.8f, 2, 0.15); sp(w, Particle.END_ROD, l, 1, 0, 0, 0, 0.01); });
+        expandRing(t.getLocation(), 3, 8, l -> dustAt(l, 255, 220, 100, 1.7f, 1, 0.05));
+        msg(p, Component.text("JUDGEMENT'S MARK placed", NamedTextColor.GOLD));
+        new BukkitRunnable() {                                  // a golden halo marks the judged target for 20 seconds
+            int n = 0;
+            @Override public void run() {
+                if (!t.isValid() || t.isDead() || n++ >= 40) { cancel(); return; }
+                Location head = t.getEyeLocation().add(0, 0.8, 0);
+                for (int i = 0; i < 10; i++) {
+                    double a = i * Math.PI / 5 + n * 0.4;
+                    dustAt(head.clone().add(Math.cos(a) * 0.5, 0, Math.sin(a) * 0.5), 255, 220, 100, 1.1f, 1, 0.01);
+                }
+                sp(w, Particle.END_ROD, head, 1, .2, .1, .2, 0.01);
+            }
+        }.runTaskTimer(this, 0, 10);
+    }
+
+    // ------------------------------------------------------------------ Priest's Staff
+    void inspire(Player p) {
+        if (!cd(p, "inspire", 60)) return;
+        List<Player> targets = new ArrayList<>();
+        targets.add(p);
+        for (Entity en : p.getNearbyEntities(20, 20, 20))
+            if (en instanceof Player pl && ally(p, pl) && pl.getLocation().distanceSquared(p.getLocation()) <= 400) targets.add(pl);
+        World w = p.getWorld();
+        for (Player t : targets) {
+            t.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 400, 2));
+            t.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, 400, 1));
+            sp(t.getWorld(), Particle.END_ROD, t.getLocation().add(0, 1, 0), 40, .5, .9, .5, 0.1);
+            column(t.getLocation(), 4, l -> dustAt(l, 255, 240, 170, 1.5f, 2, 0.3));
+            t.playSound(t.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 1f, 1.3f);
+            if (t != p) msg(t, Component.text("Inspired by " + p.getName() + "!", NamedTextColor.GOLD));
+        }
+        expandRing(p.getLocation(), 20, 16, l -> { dustAt(l, 255, 240, 170, 1.8f, 1, 0.05); sp(w, Particle.END_ROD, l, 1, 0, 0.2, 0, 0.02); });
+        msg(p, Component.text("INSPIRE - " + targets.size() + " inspired", NamedTextColor.GOLD));
+    }
+
+    int offeringValue(Material m) {
+        return switch (m) {
+            case COAL, COAL_ORE, DEEPSLATE_COAL_ORE, RAW_COPPER, COPPER_INGOT, COPPER_ORE, DEEPSLATE_COPPER_ORE -> 1;
+            case IRON_INGOT, RAW_IRON, IRON_ORE, DEEPSLATE_IRON_ORE -> 2;
+            case GOLD_INGOT, RAW_GOLD, GOLD_ORE, DEEPSLATE_GOLD_ORE, NETHER_GOLD_ORE -> 4;
+            case DIAMOND, DIAMOND_ORE, DEEPSLATE_DIAMOND_ORE -> 5;
+            case NETHERITE_INGOT, NETHERITE_SCRAP, ANCIENT_DEBRIS -> 10;
+            case COAL_BLOCK, RAW_COPPER_BLOCK, COPPER_BLOCK -> 10;
+            case IRON_BLOCK, RAW_IRON_BLOCK -> 20;
+            case GOLD_BLOCK, RAW_GOLD_BLOCK -> 40;
+            case DIAMOND_BLOCK -> 50;
+            case NETHERITE_BLOCK -> 100;
+            default -> 0;
+        };
+    }
+
+    int sacPercent(Inventory inv) {
+        int sum = 0;
+        for (int i = 0; i < 18; i++) {
+            ItemStack it = inv.getItem(i);
+            if (it != null) sum += offeringValue(it.getType()) * it.getAmount();
+        }
+        return Math.min(100, sum);
+    }
+
+    void updateSacButton(Inventory inv) {
+        int pct = sacPercent(inv);
+        ItemStack b = new ItemStack(Material.LIME_CONCRETE);
+        ItemMeta m = b.getItemMeta();
+        m.displayName(Component.text("CONFIRM - " + pct + "%", NamedTextColor.GOLD).decoration(TextDecoration.ITALIC, false));
+        m.lore(List.of(Component.text("Each percent = 1 durability point on every armor", NamedTextColor.GRAY).decoration(TextDecoration.ITALIC, false),
+                Component.text("piece worn by nearby enemies (max 100)", NamedTextColor.GRAY).decoration(TextDecoration.ITALIC, false)));
+        b.setItemMeta(m);
+        inv.setItem(26, b);
+    }
+
+    void openSacrifice(Player p) {
+        if (remaining(p, "sacrifice") > 0) { msg(p, Component.text("Sacrifice is on cooldown: " + remaining(p, "sacrifice") + "s", NamedTextColor.RED)); return; }
+        Inventory inv = Bukkit.createInventory(null, 27, Component.text("Sacrifice to the Gods", NamedTextColor.GOLD));
+        ItemStack pane = new ItemStack(Material.BLACK_STAINED_GLASS_PANE);
+        ItemMeta pm = pane.getItemMeta();
+        pm.displayName(Component.text(" "));
+        pane.setItemMeta(pm);
+        for (int i = 18; i < 26; i++) inv.setItem(i, pane);
+        SacGui g = new SacGui();
+        g.inv = inv;
+        sacGuis.put(p.getUniqueId(), g);
+        updateSacButton(inv);
+        p.openInventory(inv);
+        p.playSound(p.getLocation(), Sound.BLOCK_ENCHANTMENT_TABLE_USE, 1f, 0.8f);
+    }
+
+    void confirmSacrifice(Player p, SacGui g) {
+        int pct = sacPercent(g.inv);
+        if (pct <= 0) { msg(p, Component.text("Offer valuable ores first", NamedTextColor.GRAY)); return; }
+        if (!cd(p, "sacrifice", 90, true)) { msg(p, Component.text("Sacrifice is on cooldown", NamedTextColor.RED)); return; }
+        for (int i = 0; i < 18; i++) {                          // offerings are consumed, anything else is handed back on close
+            ItemStack it = g.inv.getItem(i);
+            if (it != null && offeringValue(it.getType()) > 0) g.inv.setItem(i, null);
+        }
+        p.closeInventory();
+        double r = getConfig().getDouble("priest-sacrifice-radius", 15);
+        World w = p.getWorld();
+        int hits = 0;
+        for (Entity en : p.getNearbyEntities(r, r, r)) {
+            if (!(en instanceof LivingEntity le) || en instanceof ArmorStand || ally(p, en)) continue;
+            if (!(le instanceof Player || le instanceof Enemy)) continue;
+            if (en.getLocation().distanceSquared(p.getLocation()) > r * r) continue;
+            drainAllArmor(le, pct);
+            hits++;
+            beam(p.getEyeLocation(), le.getLocation().add(0, 1, 0), 0.4, l -> { dustAt(l, 255, 235, 140, 1.5f, 1, 0.05); sp(w, Particle.END_ROD, l, 1, 0, 0, 0, 0.01); });
+            sp(w, Particle.TOTEM_OF_UNDYING, le.getLocation().add(0, 1, 0), 25, .4, .7, .4, 0.3);
+        }
+        w.playSound(p.getLocation(), Sound.ENTITY_ELDER_GUARDIAN_CURSE, 1f, 1.4f);
+        w.playSound(p.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, 1f, 1f);
+        column(p.getLocation(), 12, l -> { dustAt(l, 255, 240, 170, 2f, 3, 0.4); sp(w, Particle.END_ROD, l, 1, .3, 0, .3, 0.02); });
+        expandRing(p.getLocation(), r, 14, l -> dustAt(l, 255, 235, 140, 1.8f, 1, 0.05));
+        msg(p, Component.text("SACRIFICE " + pct + "% - " + hits + " enemies' armor damaged", NamedTextColor.GOLD));
+    }
+
+    @EventHandler
+    public void onSacClick(InventoryClickEvent e) {
+        if (!(e.getWhoClicked() instanceof Player p)) return;
+        SacGui g = sacGuis.get(p.getUniqueId());
+        if (g == null || e.getView().getTopInventory() != g.inv) return;
+        int raw = e.getRawSlot();
+        if (raw >= 18 && raw < 27) {
+            e.setCancelled(true);
+            if (raw == 26) Bukkit.getScheduler().runTask(this, () -> confirmSacrifice(p, g));
+            return;
+        }
+        Bukkit.getScheduler().runTask(this, () -> updateSacButton(g.inv));
+    }
+
+    @EventHandler
+    public void onSacDrag(InventoryDragEvent e) {
+        if (!(e.getWhoClicked() instanceof Player p)) return;
+        SacGui g = sacGuis.get(p.getUniqueId());
+        if (g == null || e.getView().getTopInventory() != g.inv) return;
+        for (int raw : e.getRawSlots()) if (raw >= 18 && raw < 27) { e.setCancelled(true); return; }
+        Bukkit.getScheduler().runTask(this, () -> updateSacButton(g.inv));
+    }
+
+    @EventHandler
+    public void onSacClose(InventoryCloseEvent e) {
+        if (!(e.getPlayer() instanceof Player p)) return;
+        SacGui g = sacGuis.get(p.getUniqueId());
+        if (g == null || e.getInventory() != g.inv) return;
+        sacGuis.remove(p.getUniqueId());
+        for (int i = 0; i < 18; i++) {
+            ItemStack it = g.inv.getItem(i);
+            if (it == null) continue;
+            g.inv.setItem(i, null);
+            p.getInventory().addItem(it).values().forEach(x -> p.getWorld().dropItemNaturally(p.getLocation(), x));
+        }
+    }
+
+    // ------------------------------------------------------------------ Jackpot (Gambler's Sword)
+    Location reelLoc(Player p, int i) {
+        Vector dir = p.getLocation().getDirection().setY(0);
+        if (dir.lengthSquared() < 1e-4) dir = new Vector(0, 0, 1);
+        dir.normalize();
+        Vector right = new Vector(-dir.getZ(), 0, dir.getX());
+        return p.getLocation().add(0, 2.7, 0).add(right.multiply((i - 1) * 0.9));
+    }
+
+    void addAbsorption(Player p, double hp, int ticks) {
+        p.setAbsorptionAmount(p.getAbsorptionAmount() + hp);
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (p.isOnline()) p.setAbsorptionAmount(Math.max(0, p.getAbsorptionAmount() - hp));
+        }, ticks);
+    }
+
+    void luckyDraw(Player p) {
+        if (!cd(p, "lucky_draw", 45)) return;
+        int r = rng.nextInt(100);
+        final int outcome = r < 15 ? 0 : (r < 45 ? 1 : (r < 75 ? 2 : 3));     // 15% emeralds, 30% gold, 30% diamonds, 25% skull
+        final Material[] syms = {Material.EMERALD, Material.GOLD_INGOT, Material.DIAMOND, Material.SKELETON_SKULL};
+        World w = p.getWorld();
+        ItemDisplay[] reels = new ItemDisplay[3];
+        for (int i = 0; i < 3; i++) {
+            reels[i] = w.spawn(reelLoc(p, i), ItemDisplay.class, dsp -> {
+                dsp.setItemStack(new ItemStack(Material.EMERALD));
+                dsp.setBillboard(Display.Billboard.CENTER);
+            });
+        }
+        new BukkitRunnable() {
+            int n = 0;
+            @Override public void run() {
+                if (!p.isOnline()) { for (ItemDisplay rd : reels) rd.remove(); cancel(); return; }
+                for (int i = 0; i < 3; i++) {
+                    int stopAt = 14 + i * 6;
+                    if (n < stopAt) reels[i].setItemStack(new ItemStack(syms[rng.nextInt(4)]));
+                    else if (n == stopAt) {
+                        reels[i].setItemStack(new ItemStack(syms[outcome]));
+                        p.getWorld().playSound(p.getLocation(), Sound.BLOCK_NOTE_BLOCK_BELL, 1f, 0.8f + i * 0.3f);
+                    }
+                    reels[i].teleport(reelLoc(p, i));
+                }
+                if (n % 2 == 0 && n < 26) p.getWorld().playSound(p.getLocation(), Sound.BLOCK_NOTE_BLOCK_HAT, 0.6f, 1.6f);
+                n++;
+                if (n == 28) applyDraw(p, outcome);
+                if (n > 48) { for (ItemDisplay rd : reels) rd.remove(); cancel(); }
+            }
+        }.runTaskTimer(this, 0, 2);
+    }
+
+    void applyDraw(Player p, int outcome) {
+        World w = p.getWorld(); Location b = p.getLocation().add(0, 1, 0);
+        switch (outcome) {
+            case 0 -> {                                                        // 3 emeralds: JACKPOT
+                p.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, 300, 2));
+                p.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 300, 2));
+                p.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, 300, 1));
+                sp(w, Particle.HAPPY_VILLAGER, b, 60, 1, 1.2, 1, 0);
+                sp(w, Particle.FIREWORK, b, 60, 1, 1.2, 1, 0.2);
+                w.playSound(b, Sound.UI_TOAST_CHALLENGE_COMPLETE, 1f, 1f);
+                msg(p, Component.text("JACKPOT! Three emeralds", NamedTextColor.GREEN));
+            }
+            case 1 -> {                                                        // 3 gold: Big Win
+                p.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, 300, 2));
+                p.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 300, 1));
+                addAbsorption(p, 6.0, 300);
+                sp(w, Particle.ITEM, b, 60, .8, 1, .8, 0.2, new ItemStack(Material.GOLD_NUGGET));
+                w.playSound(b, Sound.ENTITY_PLAYER_LEVELUP, 1f, 1.2f);
+                msg(p, Component.text("BIG WIN! Three gold", NamedTextColor.GOLD));
+            }
+            case 2 -> {                                                        // 3 diamonds: Fortune
+                fortuneHits.put(p.getUniqueId(), 3);
+                sp(w, Particle.END_ROD, b, 50, .8, 1, .8, 0.15);
+                w.playSound(b, Sound.BLOCK_AMETHYST_BLOCK_CHIME, 1f, 1.4f);
+                msg(p, Component.text("FORTUNE! Your next 3 attacks deal +2 hearts true damage", NamedTextColor.AQUA));
+            }
+            default -> {                                                       // skull: Bust
+                p.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 400, 1));
+                p.addPotionEffect(new PotionEffect(PotionEffectType.WEAKNESS, 400, 1));
+                sp(w, Particle.SMOKE, b, 50, .6, 1, .6, 0.05);
+                w.playSound(b, Sound.ENTITY_WITHER_HURT, 1f, 0.8f);
+                msg(p, Component.text("BUST... Skull", NamedTextColor.DARK_GRAY));
+            }
+        }
+    }
+
+    void doubleOrNothing(Player p) {
+        if (!cd(p, "double_or_nothing", 60)) return;
+        World w = p.getWorld(); Location b = p.getLocation().add(0, 1, 0);
+        if (rng.nextBoolean()) {
+            int streak = doubleStreak.merge(p.getUniqueId(), 1, Integer::sum);
+            if (streak >= 3) {                                                 // three Doubles in a row
+                doubleStreak.remove(p.getUniqueId());
+                jackpotBurst(p);
+            } else {
+                doubleHits.put(p.getUniqueId(), 5);
+                p.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 200, 1));
+                sp(w, Particle.ITEM, b, 40, .7, 1, .7, 0.2, new ItemStack(Material.GOLD_NUGGET));
+                sp(w, Particle.FIREWORK, b, 25, .6, 1, .6, 0.1);
+                w.playSound(b, Sound.ENTITY_PLAYER_LEVELUP, 1f, 1.5f);
+                msg(p, Component.text("DOUBLE! (" + streak + "/3) Next 5 attacks deal 1.5x", NamedTextColor.GOLD));
+            }
+        } else {
+            doubleStreak.remove(p.getUniqueId());
+            sp(w, Particle.SMOKE, b, 30, .5, .8, .5, 0.03);
+            w.playSound(b, Sound.BLOCK_NOTE_BLOCK_BASS, 1f, 0.5f);
+            msg(p, Component.text("Nothing...", NamedTextColor.GRAY));
+        }
+    }
+
+    void jackpotBurst(Player p) {
+        p.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, 200, 3));       // Strength IV
+        p.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 200, 2));          // Speed III
+        p.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, 200, 1));   // Regeneration II
+        addAbsorption(p, 10.0, 200);                                                  // 5 hearts
+        World w = p.getWorld(); Location b = p.getLocation().add(0, 1, 0);
+        sp(w, Particle.ITEM, b, 140, 1.2, 1.5, 1.2, 0.3, new ItemStack(Material.GOLD_NUGGET));
+        sp(w, Particle.FIREWORK, b, 80, 1, 1.5, 1, 0.2);
+        sp(w, Particle.TOTEM_OF_UNDYING, b, 80, 1, 1.5, 1, 0.5);
+        expandRing(p.getLocation(), 6, 12, l -> { dustAt(l, 255, 215, 60, 2f, 1, 0.05); sp(w, Particle.FIREWORK, l, 1, 0, 0.2, 0, 0.1); });
+        w.playSound(b, Sound.UI_TOAST_CHALLENGE_COMPLETE, 1f, 1f);
+        w.playSound(b, Sound.ENTITY_FIREWORK_ROCKET_BLAST, 1.2f, 1f);
+        msg(p, Component.text("JACKPOT!!! Three doubles in a row", NamedTextColor.GOLD));
+    }
+
+    void houseEdge(Player p) {
+        switch (rng.nextInt(5)) {
+            case 0 -> { p.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 100, 2)); msg(p, Component.text("House Edge: Speed III", NamedTextColor.GOLD)); }
+            case 1 -> { p.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, 100, 2)); msg(p, Component.text("House Edge: Regeneration III", NamedTextColor.GOLD)); }
+            case 2 -> { p.addPotionEffect(new PotionEffect(PotionEffectType.ABSORPTION, 200, 4)); msg(p, Component.text("House Edge: Absorption V", NamedTextColor.GOLD)); }
+            case 3 -> { houseBonus.put(p.getUniqueId(), 1); msg(p, Component.text("House Edge: your next hit deals +1 heart", NamedTextColor.GOLD)); }
+            default -> msg(p, Component.text("House Edge: nothing this time", NamedTextColor.GRAY));
+        }
+        sp(p.getWorld(), Particle.ITEM, p.getLocation().add(0, 1.5, 0), 12, .4, .4, .4, 0.1, new ItemStack(Material.GOLD_NUGGET));
+    }
+
+    // ------------------------------------------------------------------ melee-range targeting (Ten Ton Axe, Chrono Blade)
+    LivingEntity meleeTarget(Player p) {
+        LivingEntity t = lookTarget(p, 6);
+        if (t != null) return t;
+        Vector dir = p.getLocation().getDirection().setY(0);
+        if (dir.lengthSquared() < 1e-4) return null;
+        dir.normalize();
+        LivingEntity best = null;
+        double bd = 99;
+        for (Entity en : p.getNearbyEntities(3.5, 2.5, 3.5)) {
+            if (!(en instanceof LivingEntity le) || en instanceof ArmorStand || ally(p, en)) continue;
+            Vector rel = en.getLocation().toVector().subtract(p.getLocation().toVector()).setY(0);
+            double d = rel.length();
+            if (d < 0.01 || d > 3.5) continue;
+            if (rel.clone().normalize().dot(dir) < 0.35) continue;     // in front of you, about 70 degrees to each side
+            if (d < bd) { bd = d; best = le; }
+        }
+        return best;
+    }
+
     // ------------------------------------------------------------------ visual effects + HUD
     void sp(World w, Particle p, Location l, int n) { sp(w, p, l, n, 0, 0, 0, 0); }
     void sp(World w, Particle p, Location l, int n, double dx, double dy, double dz) { sp(w, p, l, n, dx, dy, dz, 0); }
     void sp(World w, Particle p, Location l, int n, double dx, double dy, double dz, double speed) {
-        try { w.spawnParticle(p, l, n, dx, dy, dz, speed); } catch (Exception ignored) { }
+        try { w.spawnParticle(p, l, n, dx, dy, dz, speed); }
+        catch (Exception ex) {
+            if (p == Particle.DRAGON_BREATH) { try { w.spawnParticle(p, l, n, dx, dy, dz, speed, 1.0f); } catch (Exception ignored) { } }
+        }
     }
     <T> void sp(World w, Particle p, Location l, int n, double dx, double dy, double dz, double speed, T data) {
         try { w.spawnParticle(p, l, n, dx, dy, dz, speed, data); } catch (Exception ignored) { }
@@ -1368,6 +2472,13 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "royal_spear" -> { sp(w, Particle.END_ROD, l, 14, .3, .5, .3, 0.12); dustAt(l, 255, 205, 60, 1.3f, 14, 0.4); }
             case "divine_judgement" -> { sp(w, Particle.END_ROD, l, 16, .3, .5, .3, 0.15); dustAt(l, 255, 220, 100, 1.5f, 12, 0.4); sp(w, Particle.TOTEM_OF_UNDYING, l, 6, .3, .5, .3, 0.2); }
             case "hammer_of_the_void" -> { sp(w, Particle.REVERSE_PORTAL, l, 30, .4, .5, .4, 0.2); dustAt(l, 140, 50, 255, 1.5f, 10, 0.4); }
+            case "chrono_blade" -> { dustAt(l, 255, 215, 90, 1.4f, 14, 0.4); dustAt(l, 80, 110, 255, 1.2f, 8, 0.4); sp(w, Particle.END_ROD, l, 8, .3, .5, .3, 0.1); }
+            case "soul_reaper" -> { sp(w, Particle.SOUL, l, 8, .3, .5, .3, 0.05); dustAt(l, 170, 60, 255, 1.4f, 12, 0.4); }
+            case "dragons_rend" -> { dustAt(l, 150, 60, 255, 1.5f, 14, 0.4); sp(w, Particle.REVERSE_PORTAL, l, 25, .4, .5, .4, 0.3); sp(w, Particle.DRAGON_BREATH, l, 6, .3, .4, .3, 0.02); }
+            case "axe_of_abyss" -> { dustAt(l, 60, 20, 90, 1.8f, 14, 0.4); sp(w, Particle.SMOKE, l, 10, .3, .5, .3, 0.05); sp(w, Particle.PORTAL, l, 20, .4, .5, .4, 0.6); }
+            case "divine_executioner" -> { dustAt(l, 255, 220, 100, 1.5f, 14, 0.4); sp(w, Particle.END_ROD, l, 14, .3, .5, .3, 0.15); sp(w, Particle.TOTEM_OF_UNDYING, l, 4, .3, .5, .3, 0.2); }
+            case "priests_staff" -> { dustAt(l, 255, 240, 170, 1.4f, 12, 0.4); sp(w, Particle.END_ROD, l, 10, .3, .5, .3, 0.1); sp(w, Particle.HAPPY_VILLAGER, l, 5, .3, .5, .3, 0); }
+            case "gamblers_sword" -> { dustAt(l, 220, 20, 40, 1.4f, 10, 0.4); dustAt(l, 255, 215, 60, 1.2f, 8, 0.4); sp(w, Particle.ITEM, l, 8, .3, .5, .3, 0.15, new ItemStack(Material.GOLD_NUGGET)); }
             case "temporal_reaver" -> { dustAt(l, 50, 230, 100, 1.4f, 16, 0.4); sp(w, Particle.END_ROD, l, 8, .3, .5, .3, 0.1); dustAt(l, 255, 205, 60, 1.0f, 8, 0.4); }
             default -> { }
         }
@@ -1385,6 +2496,12 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "sculk_battle_axe" -> { sp(w, Particle.SCULK_SOUL, h, 1, .5, .6, .5, 0.02); dustAt(h, 30, 200, 230, 0.9f, 1, 0.5); }
             case "royal_spear", "divine_judgement" -> { sp(w, Particle.END_ROD, h, 1, .5, .7, .5, 0.01); dustAt(h, 255, 205, 60, 0.9f, 1, 0.5); }
             case "hammer_of_the_void" -> { sp(w, Particle.PORTAL, h, 2, .5, .7, .5, 0.4); dustAt(h, 140, 50, 255, 0.9f, 1, 0.5); }
+            case "chrono_blade" -> { dustAt(h, 255, 215, 90, 0.9f, 2, 0.6); dustAt(h, 80, 110, 255, 0.8f, 1, 0.6); }
+            case "soul_reaper" -> { sp(w, Particle.SOUL, h, 1, .5, .6, .5, 0.02); dustAt(h, 170, 60, 255, 0.9f, 2, 0.6); }
+            case "dragons_rend" -> { sp(w, Particle.REVERSE_PORTAL, h, 2, .5, .7, .5, 0.2); dustAt(h, 150, 60, 255, 0.9f, 2, 0.6); }
+            case "axe_of_abyss" -> { sp(w, Particle.SMOKE, h, 2, .5, .7, .5, 0.02); dustAt(h, 80, 25, 120, 1.0f, 2, 0.6); }
+            case "divine_executioner", "priests_staff" -> { sp(w, Particle.END_ROD, h, 1, .5, .7, .5, 0.01); dustAt(h, 255, 230, 140, 0.9f, 2, 0.6); }
+            case "gamblers_sword" -> { dustAt(h, 220, 30, 50, 0.9f, 1, 0.6); dustAt(h, 255, 215, 60, 0.8f, 1, 0.6); }
             case "temporal_reaver" -> { dustAt(h, 50, 230, 100, 0.9f, 2, 0.6); dustAt(h, 255, 205, 60, 0.7f, 1, 0.6); }
             case "primal_bow" -> dustAt(h, 80, 225, 225, 0.9f, 2, 0.6);
             case "mad_scientists_crossbow" -> { dustAt(h, 120, 255, 30, 0.9f, 2, 0.6); sp(w, Particle.BUBBLE_POP, h, 1, .4, .6, .4, 0); }
@@ -1418,6 +2535,13 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "temporal_reaver" -> new String[][]{{"F Cleave", "temporal_cleave"}, {"Shift+F Dismember", "temporal_dismemberment"}};
             case "primal_bow" -> new String[][]{{"F Hunt", "live_for_the_hunt"}};
             case "mad_scientists_crossbow" -> new String[][]{{"Grapple", "grapple"}};
+            case "chrono_blade" -> new String[][]{{"F Time Warp", "time_warp"}, {"Shift+F Ageing", "ageing_strike"}};
+            case "soul_reaper" -> new String[][]{{"F Drain", "health_drain"}, {"Shift+F Life", "life_giver"}};
+            case "dragons_rend" -> new String[][]{{"F Void Slash", "void_slash"}, {"Shift+F Domain", "dragons_domain"}};
+            case "axe_of_abyss" -> new String[][]{{"F Cleave", "abyssal_cleave"}, {"Shift+F Void Power", "void_power"}};
+            case "divine_executioner" -> new String[][]{{"F Execution", "execution"}, {"Shift+F Mark", "judgements_mark"}};
+            case "priests_staff" -> new String[][]{{"F Inspire", "inspire"}, {"Shift+F Sacrifice", "sacrifice"}};
+            case "gamblers_sword" -> new String[][]{{"F Lucky Draw", "lucky_draw"}, {"Shift+F Double/Nothing", "double_or_nothing"}};
             default -> new String[0][];
         };
     }
@@ -1434,6 +2558,16 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "sculk_beams", "summon_warden", "live_for_the_hunt" -> new int[]{40, 210, 230};
             case "royal_judgement", "piercing_strike", "smite" -> new int[]{255, 205, 60};
             case "temporal_cleave", "temporal_dismemberment" -> new int[]{50, 230, 100};
+            case "imperial_reprisal", "imperial_decree", "royal_slam", "royal_dash" -> new int[]{255, 205, 60};
+            case "time_warp" -> new int[]{255, 215, 90};
+            case "ageing_strike" -> new int[]{170, 170, 150};
+            case "health_drain" -> new int[]{170, 60, 255};
+            case "life_giver" -> new int[]{90, 255, 120};
+            case "void_slash", "dragons_domain" -> new int[]{150, 60, 255};
+            case "abyssal_cleave", "void_power" -> new int[]{110, 40, 160};
+            case "execution", "judgements_mark" -> new int[]{255, 220, 100};
+            case "inspire", "sacrifice" -> new int[]{255, 240, 170};
+            case "lucky_draw", "double_or_nothing" -> new int[]{230, 40, 60};
             default -> new int[]{255, 255, 255};
         };
     }
@@ -1488,6 +2622,8 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             p.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, 30, 0, true, false, true));
             p.addPotionEffect(new PotionEffect(PotionEffectType.HEALTH_BOOST, 30, 4, true, false, true));   // +20 HP = 10 hearts
         }
+        if ("kings_step".equals(id(p.getInventory().getBoots())))
+            p.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 60, 2, true, false, true));       // Speed III
         String id = id(p.getInventory().getItemInMainHand());
         if (id == null) return;
         switch (id) {
@@ -1511,7 +2647,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     public void onSwap(PlayerSwapHandItemsEvent e) {
         Player p = e.getPlayer();
         String id = id(p.getInventory().getItemInMainHand());
-        if (id == null || id.equals("kings_crown") || id.equals("mad_scientists_crossbow")) return;
+        if (id == null || id.startsWith("kings_") || id.equals("mad_scientists_crossbow")) return;
         e.setCancelled(true);
         if (isStunned(p)) return;
         boolean sh = p.isSneaking();
@@ -1525,6 +2661,13 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "sculk_battle_axe" -> { if (sh) summonWarden(p); else sculkBeams(p); }
             case "royal_spear" -> { if (sh) piercingStrike(p); else royalJudgement(p); }
             case "temporal_reaver" -> { if (sh) temporalDismember(p); else temporalCleave(p); }
+            case "chrono_blade" -> { if (sh) ageingStrike(p); else timeWarp(p); }
+            case "soul_reaper" -> { if (sh) lifeGiver(p); else healthDrain(p); }
+            case "dragons_rend" -> { if (sh) dragonsDomain(p); else voidSlash(p); }
+            case "axe_of_abyss" -> { if (sh) voidPower(p); else abyssalCleave(p); }
+            case "divine_executioner" -> { if (sh) judgementsMark(p); else execution(p); }
+            case "priests_staff" -> { if (sh) openSacrifice(p); else inspire(p); }
+            case "gamblers_sword" -> { if (sh) doubleOrNothing(p); else luckyDraw(p); }
             case "primal_bow" -> { if (!sh) liveForTheHunt(p); }
             case "divine_judgement" -> { if (!sh) smite(p); }
             case "hammer_of_the_void" -> { if (!sh) voidThrow(p); }
@@ -1583,7 +2726,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     @EventHandler(ignoreCancelled = true)
     public void onWindCharge(ProjectileLaunchEvent e) {
-        if (e.getEntity() instanceof WindCharge w && w.getShooter() instanceof Player p && isEclipsed(p)) {
+        if (e.getEntity() instanceof WindCharge w && w.getShooter() instanceof Player p && (isEclipsed(p) || domainBlocks(p))) {
             e.setCancelled(true);
             msg(p, Component.text("Wind charges are disabled by the eclipse!", NamedTextColor.RED));
         }
@@ -1591,7 +2734,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     @EventHandler(ignoreCancelled = true)
     public void onCobweb(BlockPlaceEvent e) {
-        if (e.getBlock().getType() == Material.COBWEB && isEclipsed(e.getPlayer())) {
+        if (e.getBlock().getType() == Material.COBWEB && (isEclipsed(e.getPlayer()) || domainBlocks(e.getPlayer()))) {
             e.setCancelled(true);
             msg(e.getPlayer(), Component.text("Cobwebs are disabled by the eclipse!", NamedTextColor.RED));
         }
@@ -1832,7 +2975,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     }
 
     void stunningStrike(Player p) {
-        LivingEntity t = lookTarget(p, 6);
+        LivingEntity t = meleeTarget(p);
         if (t == null) { msg(p, Component.text("No target in reach", NamedTextColor.GRAY)); return; }
         if (!cd(p, "stunning_strike", 30)) return;
         stun(t, 60);
@@ -1858,7 +3001,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     }
 
     void durabilityDrain(Player p) {
-        LivingEntity t = lookTarget(p, 6);
+        LivingEntity t = meleeTarget(p);
         if (t == null) { msg(p, Component.text("No target in reach", NamedTextColor.GRAY)); return; }
         if (!cd(p, "durability_drain", 60)) return;
         trueDamage(t, p, 4.0);
@@ -2105,12 +3248,13 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     @EventHandler(ignoreCancelled = true)
     public void onWaterFlow(BlockFromToEvent e) {
-        if (e.getBlock().getType() == Material.WATER && (inIncin(e.getBlock().getLocation()) || inIncin(e.getToBlock().getLocation()))) e.setCancelled(true);
+        if (e.getBlock().getType() == Material.WATER && (inIncin(e.getBlock().getLocation()) || inIncin(e.getToBlock().getLocation())
+                || inDomain(e.getBlock().getLocation()) || inDomain(e.getToBlock().getLocation()))) e.setCancelled(true);
     }
 
     @EventHandler(ignoreCancelled = true)
     public void onBucket(PlayerBucketEmptyEvent e) {
-        if (e.getBucket() == Material.WATER_BUCKET && inIncin(e.getBlock().getLocation())) e.setCancelled(true);
+        if (e.getBucket() == Material.WATER_BUCKET && (inIncin(e.getBlock().getLocation()) || domainBlocks(e.getPlayer()))) e.setCancelled(true);
     }
 
     // ------------------------------------------------------------------ combat hooks
@@ -2131,6 +3275,11 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 && p.getWorld().equals(victim.getWorld())
                 && victim.getLocation().distanceSquared(in.center()) <= (double) in.radius() * in.radius())
             e.setDamage(e.getDamage() * 1.25);
+
+        Domain dmn = domains.get(p.getUniqueId());
+        if (dmn != null && dmn.end() > System.currentTimeMillis() && p.getWorld().equals(victim.getWorld())
+                && victim.getLocation().distanceSquared(dmn.center()) <= (double) dmn.radius() * dmn.radius())
+            e.setDamage(e.getDamage() * 1.25);                       // Dragon's Domain: 1.25x damage to enemies inside
 
         Mark mk = marks.get(victim.getUniqueId());
         if (mk != null && mk.holder().equals(p.getUniqueId()) && mk.end() > System.currentTimeMillis())

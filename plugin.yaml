@@ -18,7 +18,14 @@ commands:
     description: Stop trusting a player
     usage: /untrust <player>
     permission: dwarven.trust
+  armour:
+    description: Activate your King's armour abilities
+    usage: /armour ability <1-4>
+    aliases: [armor]
+    permission: dwarven.armour
 permissions:
+  dwarven.armour:
+    default: true
   dwarven.trust:
     default: true
   dwarven.admin:
