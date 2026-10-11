@@ -199,23 +199,6 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                         "Ability 2 [Shift+F]: Blinding Eclipse - blind enemies, no wind charges/cobwebs 10s",
                         "Passive: Bleed every 5 hits (10s cooldown), Speed II, Strength I");
             }
-            case "gamblers_sword" -> {
-                UUID gu = p.getUniqueId();
-                Integer dh = doubleHits.get(gu);
-                if (dh != null && dh > 0) {
-                    e.setDamage(e.getDamage() * 1.5);                // Double: next 5 attacks deal 1.5x
-                    if (dh <= 1) doubleHits.remove(gu); else doubleHits.put(gu, dh - 1);
-                }
-                double extra = 0;
-                Integer fh = fortuneHits.get(gu);
-                if (fh != null && fh > 0) {                          // Fortune: next 3 attacks +2 hearts true damage
-                    extra += 4.0;
-                    if (fh <= 1) fortuneHits.remove(gu); else fortuneHits.put(gu, fh - 1);
-                }
-                if (houseBonus.remove(gu) != null) extra += 2.0;     // House Edge: +1 heart on the next hit
-                if (n % 10 == 0) houseEdge(p);
-                if (extra > 0) { final double fxd = extra; Bukkit.getScheduler().runTask(this, () -> trueDamage(victim, pf, fxd)); }
-            }
             case "stormcaller" -> {
                 mat = Material.TRIDENT; name = "Stormcaller"; col = TextColor.color(0x5AC8FF);
                 en.put(Enchantment.RIPTIDE, 3); en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
@@ -2216,7 +2199,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     void luckyDraw(Player p) {
         if (!cd(p, "lucky_draw", 45)) return;
         int r = rng.nextInt(100);
-        final int outcome = r < 15 ? 0 : (r < 45 ? 1 : (r < 75 ? 2 : 3));     // 15% emeralds, 30% gold, 30% diamonds, 25% skull
+        final int outcome = r < 10 ? 0 : (r < 30 ? 1 : (r < 50 ? 2 : 3));     // 10% emeralds, 20% gold, 20% diamonds, 50% skull (bust)
         final Material[] syms = {Material.EMERALD, Material.GOLD_INGOT, Material.DIAMOND, Material.SKELETON_SKULL};
         World w = p.getWorld();
         ItemDisplay[] reels = new ItemDisplay[3];
@@ -3315,6 +3298,23 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                 if (bc >= 5 && cd(p, "bleed", 10, true)) { bleed(victim, p); bleedHits.remove(p.getUniqueId()); }
             }
             case "divine_judgement", "hammer_of_the_void" -> { recordMace(p, id); maceHit(e, p, victim, id); }
+            case "gamblers_sword" -> {
+                UUID gu = p.getUniqueId();
+                Integer dh = doubleHits.get(gu);
+                if (dh != null && dh > 0) {
+                    e.setDamage(e.getDamage() * 1.5);                // Double: next 5 attacks deal 1.5x
+                    if (dh <= 1) doubleHits.remove(gu); else doubleHits.put(gu, dh - 1);
+                }
+                double extra = 0;
+                Integer fh = fortuneHits.get(gu);
+                if (fh != null && fh > 0) {                          // Fortune: next 3 attacks +2 hearts true damage
+                    extra += 4.0;
+                    if (fh <= 1) fortuneHits.remove(gu); else fortuneHits.put(gu, fh - 1);
+                }
+                if (houseBonus.remove(gu) != null) extra += 2.0;     // House Edge: +1 heart on the next hit
+                if (n % 10 == 0) houseEdge(p);
+                if (extra > 0) { final double fxd = extra; Bukkit.getScheduler().runTask(this, () -> trueDamage(victim, pf, fxd)); }
+            }
             case "stormcaller" -> {
                 boolean thrownHit = e.getDamager() instanceof Trident;
                 boolean strongHit = !thrownHit && p.getAttackCooldown() >= 0.9f;          // not a weak (spam) hit
