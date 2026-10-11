@@ -1,14 +1,32 @@
-name: DwarvenWeapons
+name: MarblesOpAhWeapons
+prefix: "Marble's OP Ah Weapons"
 version: 1.0.0
 main: dev.dwarven.DwarvenWeapons
 api-version: '1.21'
-description: Six custom netherite weapons with abilities and passives
+description: Marble's OP Ah Weapons - custom weapons with abilities and passives
 commands:
   dweapons:
-    description: Give or list Dwarven weapons
-    usage: /dweapons <give|list|reload> [player] [weapon]
-    aliases: [weapons, dw]
+    description: Marble's OP Ah Weapons - custom weapons with abilities and passives
+    usage: /dweapons <give|list|reload|pack|info> [player] [weapon]
+    aliases: [weapons, dw, mow]
     permission: dwarven.admin
+  trust:
+    description: Trust a player - your weapon abilities will not hit them
+    usage: /trust <player> | /trust remove <player> | /trust list
+    permission: dwarven.trust
+  untrust:
+    description: Stop trusting a player
+    usage: /untrust <player>
+    permission: dwarven.trust
+  armour:
+    description: Activate your King's armour abilities
+    usage: /armour ability <1-4>
+    aliases: [armor]
+    permission: dwarven.armour
 permissions:
+  dwarven.armour:
+    default: true
+  dwarven.trust:
+    default: true
   dwarven.admin:
     default: op
