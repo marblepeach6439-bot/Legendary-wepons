@@ -1,7 +1,28 @@
 # Optional: URL of the hosted resource pack zip (sent to players on join). Leave empty to disable.
 resource-pack-url: ""
+# SHA-1 of MarblesOpAhWeapons-ResourcePack.zip (makes players always download the newest pack)
+resource-pack-sha1: "ad89d16cf3e11b918f2570481d5fcfa3c94df46b"
+resource-pack-required: false
 # Cooldowns in seconds
 cooldowns:
+  imperial_reprisal: 30
+  imperial_decree: 30
+  royal_slam: 60
+  royal_dash: 20
+  time_warp: 300
+  ageing_strike: 30
+  health_drain: 60
+  life_giver: 30
+  void_slash: 30
+  dragons_domain: 120
+  abyssal_cleave: 30
+  void_power: 90
+  execution: 30
+  judgements_mark: 60
+  inspire: 60
+  sacrifice: 90
+  lucky_draw: 45
+  double_or_nothing: 60
   bloodbath: 45
   blinding_eclipse: 60
   lightning_storm: 30
@@ -13,7 +34,39 @@ cooldowns:
   pull_of_the_void: 30
   acidic_blaze: 45
   incineration: 120
+  sculk_beams: 60
+  summon_warden: 300
+  royal_judgement: 60
+  temporal_cleave: 90
+  temporal_dismemberment: 120
+  live_for_the_hunt: 600
+  smite: 30
+  final_verdict: 30
+  void_throw: 20
+  piercing_strike: 20   # not specified by you, change freely
 # Incineration: radius of the affected area (the "40 block area" = 40 wide, so radius 20)
 incineration-radius: 20
 # Dome radius for Call of the Deep
-dome-radius: 20
+dome-radius: 10
+# Skulk Battle Axe
+sculk-beam-armor-durability: 50   # durability removed from a random armor piece per beam
+warden-lifetime-seconds: 60       # summoned warden despawns after this long
+# Temporal Reaver
+temporal-cleave:
+  radius: 25
+  duration-seconds: 5
+temporal-dismemberment:
+  range: 25
+  clone-damage-hearts: 1.5
+  erasure-damage-hearts: 3.0
+  mark-seconds: 10
+  mark-bonus: 0.25      # +25% damage from the holder against a Marked target
+# Primal Bow
+hunters-momentum-max: 30
+# Show ability cooldowns above the hotbar while holding a weapon
+cooldown-hud: true
+# New items
+priest-sacrifice-radius: 15      # enemies this close have their armor damaged by the Priest's Staff sacrifice
+health-drain-max-gain: 20.0      # most health (in half hearts) the Soul Reaper can gain from one drain
+rift-lifetime-seconds: 30        # how long Dragon's Rend rifts stay around
+domain-breath-damage: 1.0        # damage per half second to enemies standing in Dragon's Domain
