@@ -16,6 +16,7 @@ import org.bukkit.block.data.BlockData;
 import org.bukkit.block.data.Waterlogged;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.*;
@@ -25,6 +26,8 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.block.*;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.EntityDeathEvent;
+import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.entity.EntityTargetLivingEntityEvent;
@@ -58,7 +61,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             "ten_ton_axe", "void_blade", "inferno", "sculk_battle_axe", "royal_spear", "kings_crown", "divine_judgement", "hammer_of_the_void",
             "temporal_reaver", "primal_bow", "mad_scientists_crossbow",
             "kings_shield", "kings_plate", "kings_legguards", "kings_step", "chrono_blade", "soul_reaper",
-            "dragons_rend", "axe_of_abyss", "divine_executioner", "priests_staff", "gamblers_sword");
+            "dragons_rend", "axe_of_abyss", "divine_executioner", "priests_staff", "gamblers_sword", "primal_blade");
 
     NamespacedKey KEY, HUNT_KEY, PRIMAL_KEY, CROSS_KEY;
     boolean internal = false;   // guard for our own true-damage calls
@@ -100,6 +103,13 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     final Map<UUID, Integer> fortuneHits = new HashMap<>();
     final Map<UUID, Integer> houseBonus = new HashMap<>();
     final Map<UUID, Integer> doubleStreak = new HashMap<>();
+    final Map<UUID, Integer> primalKills = new HashMap<>();
+    final Map<UUID, Integer> chains = new HashMap<>();
+    final Map<UUID, Long> chainRegen = new HashMap<>();
+    final Map<UUID, List<Wolf>> packWolves = new HashMap<>();
+    File killsFile;
+    final Map<UUID, Long> lastChain = new HashMap<>();
+    String passiveId = null;
     final Map<UUID, Integer> airHits = new HashMap<>();   // mace hits since last touching the ground
     final Map<UUID, Thrown> thrown = new HashMap<>();
     final Map<UUID, Long> holdUntil = new HashMap<>();   // action-bar message hold (HUD pauses)
@@ -122,6 +132,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         getServer().getPluginManager().registerEvents(this, this);
         buildSmeltMap();
         loadTrust();
+        loadKills();
         new BukkitRunnable() {
             @Override public void run() { for (Player p : Bukkit.getOnlinePlayers()) passives(p); }
         }.runTaskTimer(this, 20, 20);
@@ -130,6 +141,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             @Override public void run() {
                 t++;
                 tickRifts();
+                tickChains();
                 Set<UUID> axeCarriers = new HashSet<>();
                 for (Player p : Bukkit.getOnlinePlayers()) {
                     String id = id(p.getInventory().getItemInMainHand());
@@ -164,6 +176,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             Material st = incinSet.get(en.getKey());
             if (st != null && en.getKey().getType() == st) en.getKey().setBlockData(en.getValue(), false);
         }
+        for (UUID ou : new ArrayList<>(packWolves.keySet())) removePack(ou);
         incinOrig.clear(); incinSet.clear();
     }
 
@@ -362,7 +375,24 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
                         "Ability 2 [Shift+F]: Double or Nothing - 50/50, two Doubles in a row = JACKPOT (60s)",
                         "Passive: House Edge - every 10th hit rolls a small bonus");
             }
+            case "primal_blade" -> {
+                mat = Material.NETHERITE_SWORD; name = "Primal Blade"; col = TextColor.color(0x3CC878);
+                en.put(Enchantment.SHARPNESS, 5); en.put(Enchantment.FIRE_ASPECT, 2); en.put(Enchantment.UNBREAKING, 3); en.put(Enchantment.MENDING, 1);
+                lore = List.of("Grows stronger with every kill (max 10)",
+                        "Ability 1 [F]: Hunter's Grapple - chain to a block, or pull a target to you for 2 hearts true damage (10s per chain)",
+                        "3 kills: 2 extra chains | 5: Strength II | 7: Speed II | 9: untrusted players within 50 blocks glow",
+                        "10 kills - Ability 2 [Shift+F]: Hunter's Pack - 50 armored wolves for 2 minutes (30s cooldown after they leave)");
+            }
             default -> { return null; }
+        }
+        ConfigurationSection enchOverride = getConfig().getConfigurationSection("enchants." + id);
+        if (enchOverride != null) {
+            for (String ek : enchOverride.getKeys(false)) {
+                Enchantment ench = Registry.ENCHANTMENT.get(NamespacedKey.minecraft(ek.toLowerCase(Locale.ROOT)));
+                if (ench == null) continue;
+                int lvl = enchOverride.getInt(ek);
+                if (lvl <= 0) en.remove(ench); else en.put(ench, lvl);
+            }
         }
         ItemStack item = new ItemStack(mat);
         ItemMeta meta = item.getItemMeta();
@@ -405,6 +435,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         String cn = c.getName().toLowerCase(Locale.ROOT);
         if (cn.equals("trust") || cn.equals("untrust")) return handleTrust(s, cn, a);
         if (cn.equals("armour")) return handleArmour(s, a);
+        if (cn.equals("primalblade")) return handlePrimalCmd(s, a);
         if (a.length == 0) { s.sendMessage("/dweapons <give|list|reload> [player] [weapon]"); return true; }
         switch (a[0].toLowerCase()) {
             case "list" -> s.sendMessage("Weapons: " + String.join(", ", IDS));
@@ -437,6 +468,14 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             if (cn.equals("trust") && a.length == 1) o.addAll(List.of("list", "remove"));
             if (a.length <= 2) Bukkit.getOnlinePlayers().forEach(pl -> o.add(pl.getName()));
             o.removeIf(x -> !x.toLowerCase(Locale.ROOT).startsWith(a[a.length - 1].toLowerCase(Locale.ROOT)));
+            return o;
+        }
+        if (cn.equals("primalblade")) {
+            List<String> o = new ArrayList<>();
+            if (a.length == 1) o.addAll(List.of("give", "set", "reset", "info"));
+            else if (a.length == 2) Bukkit.getOnlinePlayers().forEach(pl -> o.add(pl.getName()));
+            else if (a.length == 3 && a[0].equalsIgnoreCase("set")) o.add("max");
+            o.removeIf(x -> !x.toLowerCase().startsWith(a[a.length - 1].toLowerCase()));
             return o;
         }
         if (cn.equals("armour")) {
@@ -606,7 +645,13 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     }
 
     void effect(Player p, PotionEffectType t, int amp) {
-        p.addPotionEffect(new PotionEffect(t, 60, amp, true, false, true));
+        int a = amp;
+        if (passiveId != null) {
+            int lvl = getConfig().getInt("passive-effects." + passiveId + "." + t.getKey().getKey(), -1);
+            if (lvl == 0) return;
+            if (lvl > 0) a = lvl - 1;
+        }
+        p.addPotionEffect(new PotionEffect(t, 60, a, true, false, true));
     }
 
     boolean isStunned(Player p) {
@@ -1321,6 +1366,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "royal_spear", "divine_judgement" -> new int[]{255, 205, 60};
             case "temporal_reaver" -> new int[]{50, 230, 100};
             case "chrono_blade" -> new int[]{255, 215, 90};
+            case "primal_blade" -> new int[]{60, 200, 120};
             case "soul_reaper" -> new int[]{170, 60, 255};
             case "dragons_rend" -> new int[]{150, 60, 255};
             case "axe_of_abyss" -> new int[]{100, 35, 150};
@@ -1580,7 +1626,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
     }
 
     @EventHandler
-    public void onQuitCleanup(PlayerQuitEvent e) { warps.remove(e.getPlayer().getUniqueId()); }
+    public void onQuitCleanup(PlayerQuitEvent e) { warps.remove(e.getPlayer().getUniqueId()); removePack(e.getPlayer().getUniqueId()); }
 
     void armourHud(Player p) {
         if (!getConfig().getBoolean("cooldown-hud", true)) return;
@@ -1888,7 +1934,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
 
     void dragonsDomain(Player p) {
         if (!cd(p, "dragons_domain", 120)) return;
-        int R = 5;
+        int R = getConfig().getInt("dome-radius", 10);   // same size as the Dwarven Pickaxe dome
         World w = p.getWorld(); Location c = p.getLocation().clone();
         domains.put(p.getUniqueId(), new Domain(c, R, System.currentTimeMillis() + 10_000));
         List<Block> shell = sphereShell(c, R);
@@ -2336,6 +2382,280 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         return best;
     }
 
+
+    // ------------------------------------------------------------------ Primal Blade (everything below is configurable in config.yml: primal-blade.*)
+    int pbInt(String k, int def) { return getConfig().getInt("primal-blade." + k, def); }
+    double pbDouble(String k, double def) { return getConfig().getDouble("primal-blade." + k, def); }
+    boolean pbBool(String k, boolean def) { return getConfig().getBoolean("primal-blade." + k, def); }
+    int maxKills() { return Math.max(1, pbInt("max-kills", 10)); }
+
+    void loadKills() {
+        killsFile = new File(getDataFolder(), "primal_kills.yml");
+        primalKills.clear();
+        if (!killsFile.exists()) return;
+        YamlConfiguration y = YamlConfiguration.loadConfiguration(killsFile);
+        for (String k : y.getKeys(false)) {
+            try { primalKills.put(UUID.fromString(k), Math.max(0, y.getInt(k))); } catch (IllegalArgumentException ignored) { }
+        }
+    }
+
+    void saveKills() {
+        YamlConfiguration y = new YamlConfiguration();
+        for (Map.Entry<UUID, Integer> en : primalKills.entrySet()) y.set(en.getKey().toString(), en.getValue());
+        try { getDataFolder().mkdirs(); y.save(killsFile); } catch (java.io.IOException ex) { getLogger().warning("Could not save primal_kills.yml: " + ex.getMessage()); }
+    }
+
+    int primalKillsOf(Player p) { return primalKills.getOrDefault(p.getUniqueId(), 0); }
+    int maxChains(Player p) {
+        return pbInt("base-chains", 1) + (primalKillsOf(p) >= pbInt("bonus-chains-kills", 3) ? pbInt("bonus-chains", 2) : 0);
+    }
+    int chainsOf(Player p) { return Math.max(0, Math.min(chains.getOrDefault(p.getUniqueId(), maxChains(p)), maxChains(p))); }
+
+    List<String> crossed(int old, int nw) {
+        List<String> out = new ArrayList<>();
+        if (old < pbInt("bonus-chains-kills", 3) && nw >= pbInt("bonus-chains-kills", 3)) out.add(pbInt("bonus-chains", 2) + " extra chains");
+        if (old < pbInt("strength-kills", 5) && nw >= pbInt("strength-kills", 5)) out.add("permanent Strength");
+        if (old < pbInt("speed-kills", 7) && nw >= pbInt("speed-kills", 7)) out.add("permanent Speed");
+        if (old < pbInt("glow-kills", 9) && nw >= pbInt("glow-kills", 9)) out.add("enemies within " + pbInt("glow-radius", 50) + " blocks glow");
+        if (old < pbInt("pack-kills", 10) && nw >= pbInt("pack-kills", 10)) out.add("Hunter's Pack (Shift+F)");
+        return out;
+    }
+
+    /** sets the kill count (clamped to 0..max-kills) and keeps the chain count consistent; returns the unlocks that were crossed */
+    List<String> applyKills(Player p, int wanted) {
+        UUID u = p.getUniqueId();
+        int old = primalKillsOf(p), oldMax = maxChains(p);
+        int nw = Math.max(0, Math.min(maxKills(), wanted));
+        if (nw == 0) primalKills.remove(u); else primalKills.put(u, nw);
+        int newMax = maxChains(p);
+        if (nw == 0) { chains.remove(u); chainRegen.remove(u); }
+        else if (newMax > oldMax) chains.put(u, Math.min(newMax, chains.getOrDefault(u, oldMax) + (newMax - oldMax)));
+        else chains.put(u, Math.min(chains.getOrDefault(u, newMax), newMax));
+        saveKills();
+        return crossed(old, nw);
+    }
+
+    boolean handlePrimalCmd(CommandSender s, String[] a) {
+        if (a.length < 1) { s.sendMessage("Usage: /primalblade give <player> <kills> | set <player> <kills|max> | reset <player> | info <player>"); return true; }
+        Player t = a.length >= 2 ? Bukkit.getPlayerExact(a[1]) : (s instanceof Player self ? self : null);
+        if (t == null) { s.sendMessage("Player not found (they must be online)."); return true; }
+        int old = primalKillsOf(t);
+        int target;
+        switch (a[0].toLowerCase()) {
+            case "give", "givekills", "add" -> target = old + (a.length >= 3 ? parseInt(a[2], 1) : 1);
+            case "set" -> target = (a.length >= 3 && a[2].equalsIgnoreCase("max")) ? maxKills() : (a.length >= 3 ? parseInt(a[2], 0) : 0);
+            case "reset" -> target = 0;
+            case "info" -> {
+                s.sendMessage(t.getName() + ": " + old + "/" + maxKills() + " kills, " + chainsOf(t) + "/" + maxChains(t) + " chains");
+                return true;
+            }
+            default -> { s.sendMessage("Usage: /primalblade give <player> <kills> | set <player> <kills|max> | reset <player> | info <player>"); return true; }
+        }
+        List<String> unlocked = applyKills(t, target);
+        int now = primalKillsOf(t);
+        s.sendMessage(t.getName() + " now has " + now + "/" + maxKills() + " Primal Blade kills.");
+        msg(t, Component.text("PRIMAL BLADE - kills " + now + "/" + maxKills() + (unlocked.isEmpty() ? "" : "  UNLOCKED: " + String.join(", ", unlocked)), NamedTextColor.GREEN));
+        return true;
+    }
+
+    int parseInt(String v, int def) {
+        try { return Integer.parseInt(v); } catch (NumberFormatException ex) { return def; }
+    }
+
+    void tickChains() {
+        if (chainRegen.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        long regen = (long) (pbDouble("chain-regen-seconds", 10) * 1000);
+        for (UUID u : new ArrayList<>(chainRegen.keySet())) {
+            Player p = Bukkit.getPlayer(u);
+            if (p == null) continue;
+            int mx = maxChains(p), c = chainsOf(p);
+            if (c >= mx) { chainRegen.remove(u); chains.put(u, mx); continue; }
+            if (now >= chainRegen.get(u)) {
+                chains.put(u, c + 1);
+                if (c + 1 < mx) chainRegen.put(u, now + regen); else chainRegen.remove(u);
+                p.playSound(p.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 0.8f, 1.6f);
+            }
+        }
+    }
+
+    void primalHud(Player p) {
+        int k = primalKillsOf(p), c = chainsOf(p), mx = maxChains(p);
+        long now = System.currentTimeMillis();
+        String regenTxt = c < mx ? " (" + Math.max(1L, (chainRegen.getOrDefault(p.getUniqueId(), now) - now + 999) / 1000) + "s)" : "";
+        Component line = Component.text("Kills " + k + "/" + maxKills(), NamedTextColor.GREEN)
+                .append(Component.text("  |  ", NamedTextColor.DARK_GRAY))
+                .append(Component.text("F Grapple " + c + "/" + mx + regenTxt, c > 0 ? NamedTextColor.GREEN : NamedTextColor.RED));
+        if (k >= pbInt("pack-kills", 10)) {
+            long rem = remaining(p, "hunters_pack");
+            line = line.append(Component.text("  |  ", NamedTextColor.DARK_GRAY))
+                    .append(Component.text(rem > 0 ? "Shift+F Pack " + rem + "s" : "Shift+F Pack READY", rem > 0 ? NamedTextColor.RED : NamedTextColor.GREEN));
+        }
+        p.sendActionBar(line);
+    }
+
+    void huntersGrapple(Player p) {
+        UUID u = p.getUniqueId();
+        long now = System.currentTimeMillis();
+        long delay = (long) (pbDouble("chain-delay-seconds", 0.5) * 1000);
+        Long lc = lastChain.get(u);
+        if (lc != null && now - lc < delay) return;                  // no chain spam: one shot every 0.5s
+        lastChain.put(u, now);
+        int c = chainsOf(p);
+        if (c <= 0) {
+            long left = Math.max(1L, (chainRegen.getOrDefault(u, now) - now + 999) / 1000);
+            msg(p, Component.text("No chains left - next one in " + left + "s", NamedTextColor.RED));
+            return;
+        }
+        Location eye = p.getEyeLocation();
+        Vector dir = eye.getDirection().normalize();
+        World w = p.getWorld();
+        double range = pbDouble("grapple-range", 40);
+        RayTraceResult r = w.rayTrace(eye, dir, range, FluidCollisionMode.NEVER, true, 0.6,
+                en -> en != p && en instanceof LivingEntity && !(en instanceof ArmorStand) && !ally(p, en));
+        if (r == null) { msg(p, Component.text("Nothing in range (" + (int) range + " blocks)", NamedTextColor.GRAY)); return; }
+        chains.put(u, c - 1);
+        if (chainRegen.getOrDefault(u, 0L) < now) chainRegen.put(u, now + (long) (pbDouble("chain-regen-seconds", 10) * 1000));
+        castBurst(p, "hunters_grapple");
+        w.playSound(p.getLocation(), Sound.ITEM_CROSSBOW_SHOOT, 1f, 0.7f);
+        w.playSound(p.getLocation(), Sound.ENTITY_FISHING_BOBBER_THROW, 1f, 0.6f);
+        if (r.getHitEntity() instanceof LivingEntity t) {
+            trueDamage(t, p, pbDouble("grapple-damage-hearts", 2.0) * 2);
+            if (t instanceof Player tp) noKick(tp, 5000);
+            sp(w, Particle.CRIT, t.getLocation().add(0, 1, 0), 30, .4, .6, .4, 0.4);
+            new BukkitRunnable() {                                   // the chain reels the target in
+                int n = 0;
+                @Override public void run() {
+                    if (!t.isValid() || t.isDead() || !p.isOnline() || n++ >= 16) { cancel(); return; }
+                    Vector v = p.getLocation().toVector().subtract(t.getLocation().toVector());
+                    beam(p.getEyeLocation().add(0, -0.4, 0), t.getLocation().add(0, 1, 0), 0.5, l -> { dustAt(l, 150, 150, 160, 1.3f, 1, 0.02); sp(w, Particle.CRIT, l, 1, 0, 0, 0, 0); });
+                    if (v.length() < 2.5) { cancel(); return; }
+                    t.setVelocity(v.normalize().multiply(1.5).setY(0.25));
+                }
+            }.runTaskTimer(this, 0, 1);
+        } else {
+            Vector hp = r.getHitPosition();
+            Location anchor = new Location(w, hp.getX(), hp.getY(), hp.getZ());
+            noKick(p, 6000);
+            sp(w, Particle.CRIT, anchor, 20, .2, .2, .2, 0.3);
+            w.playSound(anchor, Sound.BLOCK_ANVIL_LAND, 0.6f, 1.6f);
+            new BukkitRunnable() {                                   // you are reeled toward the block
+                int n = 0;
+                @Override public void run() {
+                    if (!p.isOnline() || p.isDead() || n++ >= 30) { cancel(); return; }
+                    Vector v = anchor.toVector().subtract(p.getEyeLocation().toVector());
+                    double d = v.length();
+                    beam(p.getEyeLocation().add(0, -0.4, 0), anchor, 0.5, l -> dustAt(l, 150, 150, 160, 1.3f, 1, 0.02));
+                    if (d < 2.0) { cancel(); return; }
+                    p.setVelocity(v.normalize().multiply(Math.min(1.8, 0.6 + d * 0.08)));
+                    p.setFallDistance(0f);
+                }
+            }.runTaskTimer(this, 0, 1);
+        }
+    }
+
+    void huntersPack(Player p) {
+        int k = primalKillsOf(p), need = pbInt("pack-kills", 10);
+        if (k < need) { msg(p, Component.text("Hunter's Pack needs " + need + " kills (" + k + "/" + need + ")", NamedTextColor.GRAY)); return; }
+        long rem = remaining(p, "hunters_pack");
+        if (rem > 0) { msg(p, Component.text("Hunter's Pack is on cooldown: " + rem + "s", NamedTextColor.RED)); return; }
+        UUID u = p.getUniqueId();
+        int life = pbInt("wolf-lifetime-seconds", 120);
+        // the cooldown starts when the pack despawns, so it is lifetime + cooldown from now
+        cooldowns.put(u + "hunters_pack", System.currentTimeMillis() + (life + pbInt("pack-cooldown-seconds", 30)) * 1000L);
+        castBurst(p, "hunters_pack");
+        World w = p.getWorld();
+        String tag = "mow_pack_" + u.toString().replace("-", "");
+        int strengthLvl = pbInt("wolf-strength-level", 2), speedLvl = pbInt("wolf-speed-level", 2);
+        List<Wolf> pack = new ArrayList<>();
+        for (int i = 0; i < pbInt("wolf-count", 50); i++) {
+            double a = rng.nextDouble() * Math.PI * 2, rr = 3 + rng.nextDouble() * 4;
+            Location l = p.getLocation().add(Math.cos(a) * rr, 0.5, Math.sin(a) * rr);
+            Wolf wolf = w.spawn(l, Wolf.class, wf -> {
+                wf.setTamed(true);
+                wf.setOwner(p);
+                wf.addScoreboardTag(tag);
+                if (strengthLvl > 0) wf.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, life * 20, strengthLvl - 1));
+                if (speedLvl > 0) wf.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, life * 20, speedLvl - 1));
+                EntityEquipment eq = wf.getEquipment();
+                if (eq != null) {
+                    eq.setItem(EquipmentSlot.BODY, new ItemStack(Material.WOLF_ARMOR));     // armadillo armor
+                    eq.setDropChance(EquipmentSlot.BODY, 0f);
+                }
+            });
+            pack.add(wolf);
+            sp(w, Particle.CLOUD, l.clone().add(0, 0.5, 0), 6, .3, .3, .3, 0.05);
+        }
+        packWolves.put(u, pack);
+        w.playSound(p.getLocation(), Sound.ENTITY_WOLF_GROWL, 1.5f, 0.7f);
+        w.playSound(p.getLocation(), Sound.ENTITY_WOLF_AMBIENT, 1.5f, 0.6f);
+        expandRing(p.getLocation(), 8, 12, l -> { dustAt(l, 60, 200, 120, 1.7f, 1, 0.05); sp(w, Particle.HAPPY_VILLAGER, l, 1, .2, .3, .2, 0); });
+        msg(p, Component.text("HUNTER'S PACK - " + pack.size() + " wolves answer your call for " + life + " seconds", NamedTextColor.GREEN));
+        new BukkitRunnable() {                                       // point the pack at the nearest untrusted player
+            int n = 0;
+            @Override public void run() {
+                if (!p.isOnline() || n++ >= life || packWolves.get(u) != pack) { cancel(); return; }
+                Player target = null;
+                double bd = 1600;
+                for (Player o : p.getWorld().getPlayers()) {
+                    if (o == p || ally(p, o) || o.getGameMode() == GameMode.CREATIVE || o.getGameMode() == GameMode.SPECTATOR) continue;
+                    double d = o.getLocation().distanceSquared(p.getLocation());
+                    if (d < bd) { bd = d; target = o; }
+                }
+                if (target != null) for (Wolf wf2 : pack) if (wf2.isValid()) wf2.setTarget(target);
+            }
+        }.runTaskTimer(this, 20, 20);
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (packWolves.get(u) == pack) removePack(u);
+        }, life * 20L);
+    }
+
+    void removePack(UUID u) {
+        List<Wolf> pack = packWolves.remove(u);
+        if (pack == null) return;
+        for (Wolf wf : pack) {
+            if (!wf.isValid()) continue;
+            sp(wf.getWorld(), Particle.CLOUD, wf.getLocation().add(0, 0.5, 0), 8, .3, .3, .3, 0.05);
+            wf.remove();
+        }
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onPackWolfTarget(EntityTargetLivingEntityEvent e) {
+        if (!(e.getEntity() instanceof Wolf wf) || !(e.getTarget() instanceof Player t)) return;
+        for (String tag : wf.getScoreboardTags()) {
+            if (!tag.startsWith("mow_pack_")) continue;
+            String ownerHex = tag.substring(9);
+            Player owner = null;
+            for (Player o : Bukkit.getOnlinePlayers()) if (o.getUniqueId().toString().replace("-", "").equals(ownerHex)) { owner = o; break; }
+            if (owner == null || t == owner || ally(owner, t)) e.setCancelled(true);
+        }
+    }
+
+    @EventHandler
+    public void onPrimalKill(EntityDeathEvent e) {
+        Player k = e.getEntity().getKiller();
+        if (k == null || e.getEntity() == k) return;
+        if (!"primal_blade".equals(id(k.getInventory().getItemInMainHand()))) return;
+        if (!(e.getEntity() instanceof Player) && !pbBool("count-mobs", false)) return;
+        int old = primalKillsOf(k);
+        if (old >= maxKills()) return;
+        List<String> unlocked = applyKills(k, old + 1);
+        int nw = primalKillsOf(k);
+        msg(k, Component.text("PRIMAL BLADE - kill " + nw + "/" + maxKills() + (unlocked.isEmpty() ? "" : "  UNLOCKED: " + String.join(", ", unlocked)), NamedTextColor.GREEN));
+        World w = k.getWorld();
+        sp(w, Particle.HAPPY_VILLAGER, k.getLocation().add(0, 1, 0), 30, .6, 1, .6, 0);
+        expandRing(k.getLocation(), 4, 8, l -> dustAt(l, 60, 200, 120, 1.6f, 1, 0.05));
+        w.playSound(k.getLocation(), unlocked.isEmpty() ? Sound.ENTITY_PLAYER_LEVELUP : Sound.UI_TOAST_CHALLENGE_COMPLETE, 1f, 1.2f);
+    }
+
+    @EventHandler
+    public void onPrimalDeath(PlayerDeathEvent e) {
+        Player p = e.getEntity();
+        removePack(p.getUniqueId());
+        if (pbBool("reset-on-death", true) && primalKills.containsKey(p.getUniqueId())) applyKills(p, 0);
+    }
+
     // ------------------------------------------------------------------ visual effects + HUD
     void sp(World w, Particle p, Location l, int n) { sp(w, p, l, n, 0, 0, 0, 0); }
     void sp(World w, Particle p, Location l, int n, double dx, double dy, double dz) { sp(w, p, l, n, dx, dy, dz, 0); }
@@ -2455,6 +2775,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "royal_spear" -> { sp(w, Particle.END_ROD, l, 14, .3, .5, .3, 0.12); dustAt(l, 255, 205, 60, 1.3f, 14, 0.4); }
             case "divine_judgement" -> { sp(w, Particle.END_ROD, l, 16, .3, .5, .3, 0.15); dustAt(l, 255, 220, 100, 1.5f, 12, 0.4); sp(w, Particle.TOTEM_OF_UNDYING, l, 6, .3, .5, .3, 0.2); }
             case "hammer_of_the_void" -> { sp(w, Particle.REVERSE_PORTAL, l, 30, .4, .5, .4, 0.2); dustAt(l, 140, 50, 255, 1.5f, 10, 0.4); }
+            case "primal_blade" -> { dustAt(l, 60, 200, 120, 1.5f, 14, 0.4); sp(w, Particle.HAPPY_VILLAGER, l, 6, .3, .5, .3, 0); sp(w, Particle.CRIT, l, 14, .3, .5, .3, 0.3); }
             case "chrono_blade" -> { dustAt(l, 255, 215, 90, 1.4f, 14, 0.4); dustAt(l, 80, 110, 255, 1.2f, 8, 0.4); sp(w, Particle.END_ROD, l, 8, .3, .5, .3, 0.1); }
             case "soul_reaper" -> { sp(w, Particle.SOUL, l, 8, .3, .5, .3, 0.05); dustAt(l, 170, 60, 255, 1.4f, 12, 0.4); }
             case "dragons_rend" -> { dustAt(l, 150, 60, 255, 1.5f, 14, 0.4); sp(w, Particle.REVERSE_PORTAL, l, 25, .4, .5, .4, 0.3); sp(w, Particle.DRAGON_BREATH, l, 6, .3, .4, .3, 0.02); }
@@ -2479,6 +2800,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "sculk_battle_axe" -> { sp(w, Particle.SCULK_SOUL, h, 1, .5, .6, .5, 0.02); dustAt(h, 30, 200, 230, 0.9f, 1, 0.5); }
             case "royal_spear", "divine_judgement" -> { sp(w, Particle.END_ROD, h, 1, .5, .7, .5, 0.01); dustAt(h, 255, 205, 60, 0.9f, 1, 0.5); }
             case "hammer_of_the_void" -> { sp(w, Particle.PORTAL, h, 2, .5, .7, .5, 0.4); dustAt(h, 140, 50, 255, 0.9f, 1, 0.5); }
+            case "primal_blade" -> { dustAt(h, 60, 200, 120, 0.9f, 2, 0.6); sp(w, Particle.HAPPY_VILLAGER, h, 1, .5, .6, .5, 0); }
             case "chrono_blade" -> { dustAt(h, 255, 215, 90, 0.9f, 2, 0.6); dustAt(h, 80, 110, 255, 0.8f, 1, 0.6); }
             case "soul_reaper" -> { sp(w, Particle.SOUL, h, 1, .5, .6, .5, 0.02); dustAt(h, 170, 60, 255, 0.9f, 2, 0.6); }
             case "dragons_rend" -> { sp(w, Particle.REVERSE_PORTAL, h, 2, .5, .7, .5, 0.2); dustAt(h, 150, 60, 255, 0.9f, 2, 0.6); }
@@ -2551,6 +2873,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "execution", "judgements_mark" -> new int[]{255, 220, 100};
             case "inspire", "sacrifice" -> new int[]{255, 240, 170};
             case "lucky_draw", "double_or_nothing" -> new int[]{230, 40, 60};
+            case "hunters_grapple", "hunters_pack" -> new int[]{60, 200, 120};
             default -> new int[]{255, 255, 255};
         };
     }
@@ -2572,6 +2895,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
         if (!getConfig().getBoolean("cooldown-hud", true)) return;
         Long hold = holdUntil.get(p.getUniqueId());
         if (hold != null && hold > System.currentTimeMillis()) return;
+        if (id.equals("primal_blade")) { primalHud(p); return; }
         String[][] abs = abilitiesOf(id);
         if (abs.length == 0) return;
         Component c = Component.empty();
@@ -2609,6 +2933,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             p.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 60, 2, true, false, true));       // Speed III
         String id = id(p.getInventory().getItemInMainHand());
         if (id == null) return;
+        passiveId = id;
         switch (id) {
             case "bloody_eclipse" -> { effect(p, PotionEffectType.SPEED, 1); effect(p, PotionEffectType.STRENGTH, 0); }
             case "stormcaller" -> { effect(p, PotionEffectType.WATER_BREATHING, 0); effect(p, PotionEffectType.DOLPHINS_GRACE, 0);
@@ -2618,6 +2943,19 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "inferno" -> effect(p, PotionEffectType.FIRE_RESISTANCE, 0);
             case "sculk_battle_axe" -> { effect(p, PotionEffectType.STRENGTH, 0); effect(p, PotionEffectType.SPEED, 1);
                 effect(p, PotionEffectType.RESISTANCE, 0); }
+            case "primal_blade" -> {
+                int pk = primalKillsOf(p);
+                if (pk >= pbInt("strength-kills", 5)) effect(p, PotionEffectType.STRENGTH, 1);      // level from passive-effects.primal_blade.strength
+                if (pk >= pbInt("speed-kills", 7)) effect(p, PotionEffectType.SPEED, 1);
+                if (pk >= pbInt("glow-kills", 9)) {                                                 // everyone untrusted nearby glows
+                    double gr = pbInt("glow-radius", 50);
+                    for (Entity pe : p.getNearbyEntities(gr, gr, gr)) {
+                        if (pe instanceof Player gv && !ally(p, gv) && gv.getGameMode() != GameMode.CREATIVE && gv.getGameMode() != GameMode.SPECTATOR
+                                && gv.getLocation().distanceSquared(p.getLocation()) <= gr * gr)
+                            gv.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING, 60, 0, true, false, false));
+                    }
+                }
+            }
             case "royal_spear" -> { effect(p, PotionEffectType.SPEED, 1);
                 Long u = lungeCd.get(p.getUniqueId());
                 if (u == null || u < System.currentTimeMillis()) setLunge(p, true); }
@@ -2651,6 +2989,7 @@ public class DwarvenWeapons extends JavaPlugin implements Listener {
             case "divine_executioner" -> { if (sh) judgementsMark(p); else execution(p); }
             case "priests_staff" -> { if (sh) openSacrifice(p); else inspire(p); }
             case "gamblers_sword" -> { if (sh) doubleOrNothing(p); else luckyDraw(p); }
+            case "primal_blade" -> { if (sh) huntersPack(p); else huntersGrapple(p); }
             case "primal_bow" -> { if (!sh) liveForTheHunt(p); }
             case "divine_judgement" -> { if (!sh) smite(p); }
             case "hammer_of_the_void" -> { if (!sh) voidThrow(p); }

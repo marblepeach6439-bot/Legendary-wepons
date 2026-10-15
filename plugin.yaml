@@ -23,6 +23,11 @@ commands:
     usage: /armour ability <1-4>
     aliases: [armor]
     permission: dwarven.armour
+  primalblade:
+    description: Give or set Primal Blade kills
+    usage: /primalblade <give|set|reset|info> <player> [kills]
+    aliases: [pb]
+    permission: dwarven.admin
 permissions:
   dwarven.armour:
     default: true
