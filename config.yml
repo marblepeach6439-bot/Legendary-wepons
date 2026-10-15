@@ -1,7 +1,7 @@
 # Optional: URL of the hosted resource pack zip (sent to players on join). Leave empty to disable.
 resource-pack-url: ""
 # SHA-1 of MarblesOpAhWeapons-ResourcePack.zip (makes players always download the newest pack)
-resource-pack-sha1: "ad89d16cf3e11b918f2570481d5fcfa3c94df46b"
+resource-pack-sha1: "35b12366e4400a71312479e95c7bf7e38207b0b4"
 resource-pack-required: false
 # Cooldowns in seconds
 cooldowns:
@@ -70,3 +70,52 @@ priest-sacrifice-radius: 15      # enemies this close have their armor damaged b
 health-drain-max-gain: 20.0      # most health (in half hearts) the Soul Reaper can gain from one drain
 rift-lifetime-seconds: 30        # how long Dragon's Rend rifts stay around
 domain-breath-damage: 1.0        # damage per half second to enemies standing in Dragon's Domain
+
+# ---------------------------------------------------------------- Primal Blade
+primal-blade:
+  max-kills: 10                 # the blade stops counting here
+  reset-on-death: true          # kills (and the perks they unlock) reset when you die
+  count-mobs: false             # false = only player kills count
+  base-chains: 1                # grapple chains you always have
+  bonus-chains: 2               # extra chains unlocked at bonus-chains-kills
+  bonus-chains-kills: 3
+  chain-regen-seconds: 10       # each chain comes back after this long
+  chain-delay-seconds: 0.5      # time between two chain shots (no spam)
+  grapple-range: 40
+  grapple-damage-hearts: 2
+  strength-kills: 5             # kills for permanent Strength (level: passive-effects.primal_blade.strength)
+  speed-kills: 7                # kills for permanent Speed   (level: passive-effects.primal_blade.speed)
+  glow-kills: 9                 # kills for Glowing on untrusted players nearby
+  glow-radius: 50
+  pack-kills: 10                # kills needed for Hunter's Pack
+  wolf-count: 50
+  wolf-lifetime-seconds: 120
+  wolf-strength-level: 2
+  wolf-speed-level: 2
+  pack-cooldown-seconds: 30     # starts when the pack despawns
+
+# ---------------------------------------------------------------- Enchantment levels (any item)
+# enchants.<item_id>.<enchantment>: level      (0 removes the enchantment). Applies to newly given items.
+# Item ids: bloody_eclipse, stormcaller, dwarven_pickaxe, ten_ton_axe, void_blade, inferno, sculk_battle_axe, royal_spear, kings_crown,
+#           divine_judgement, hammer_of_the_void, temporal_reaver, primal_bow, mad_scientists_crossbow, kings_shield, kings_plate,
+#           kings_legguards, kings_step, chrono_blade, soul_reaper, dragons_rend, axe_of_abyss, divine_executioner, priests_staff,
+#           gamblers_sword, primal_blade
+enchants:
+  primal_blade:
+    sharpness: 5
+    unbreaking: 3
+    mending: 1
+    fire_aspect: 2
+  # example: make the Void Blade sharper
+  # void_blade:
+  #   sharpness: 7
+
+# ---------------------------------------------------------------- Passive potion effect levels (any item)
+# passive-effects.<item_id>.<effect>: level      (0 turns the effect off; effect = vanilla name like strength, speed, fire_resistance)
+passive-effects:
+  primal_blade:
+    strength: 2
+    speed: 2
+  # example: Speed IV on the Void Blade
+  # void_blade:
+  #   speed: 4
